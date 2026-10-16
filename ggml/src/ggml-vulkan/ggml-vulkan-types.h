@@ -1009,6 +1009,13 @@ struct vk_device_struct {
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
+    // T2/RDNA1 decode-attention fix: run the non-FA p021 score product with the
+    // channel/head dimension fastest-varying instead of the row (key) dimension.
+    // Upstream dispatches {1, rows, channels}; consecutive workgroups then read
+    // 256 B each with a stride of nchannels*ncols*2 bytes (~4 KB here), sweeping
+    // the cache once per head. With channels fastest-varying the same reads are
+    // contiguous. Set GGML_VK_DISABLE_P021_MR to restore the upstream order.
+    bool disable_p021_mr;
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 

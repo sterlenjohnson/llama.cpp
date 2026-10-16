@@ -4030,6 +4030,9 @@ vk_device ggml_vk_get_device(size_t idx) {
         const char* GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM = getenv("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM");
         device->disable_host_visible_vidmem = GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM != nullptr;
 
+        const char* GGML_VK_DISABLE_P021_MR = getenv("GGML_VK_DISABLE_P021_MR");
+        device->disable_p021_mr = GGML_VK_DISABLE_P021_MR != nullptr;
+
         const char* GGML_VK_ALLOW_SYSMEM_FALLBACK = getenv("GGML_VK_ALLOW_SYSMEM_FALLBACK");
         device->allow_sysmem_fallback = GGML_VK_ALLOW_SYSMEM_FALLBACK != nullptr;
 
@@ -7009,9 +7012,18 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
 
     // compute
 
+    // Heads-first dispatch. Upstream launches {1, rows, channels}, so consecutive
+    // workgroups differ in the row (key/position) index; each reads BLOCK_SIZE*2
+    // bytes with a stride of nchannels*ncols*2 bytes and the L2 is swept once per
+    // head. Making the channel dimension fastest-varying turns those reads into
+    // contiguous ones. This is pure re-indexing (identical arithmetic), it only
+    // changes which workgroup visits what first. GGML_VK_DISABLE_P021_MR restores
+    // the upstream order for A/B.
+    const bool heads_first = !ctx->device->disable_p021_mr;
+
     vk_mat_vec_p021_push_constants pc = {
         (uint32_t)ne00, (uint32_t)ne01, (uint32_t)ne02, (uint32_t)ne12,
-        0, 0, fusion_flags
+        0, 0, fusion_flags, heads_first ? 1u : 0u
     };
 
     init_pushconst_tensor_offsets(ctx, pc, src0, src1, nullptr, nullptr, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
@@ -7022,6 +7034,10 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
         workgroups_z /= gqa_ratio;
     }
 
+    const std::array<uint32_t, 3> grid = heads_first
+        ? std::array<uint32_t, 3>{ 1, workgroups_z, (uint32_t)ne01 }
+        : std::array<uint32_t, 3>{ 1, (uint32_t)ne01, workgroups_z };
+
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {
             d_Qx,
@@ -7029,7 +7045,7 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
             d_D,
             d_F0,
             d_F1,
-        }, pc, { 1, (uint32_t)ne01, workgroups_z });
+        }, pc, grid);
 }
 
 static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -7334,8 +7350,14 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
         src1->nb[1] <= src1->nb[3] &&
         src0->ne[3] == 1 &&
         src1->ne[3] == 1 &&
-        src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
-        src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
+        // The workgroup grid axes depend on the dispatch order used by
+        // ggml_vk_mul_mat_vec_p021_f16_f32 (upstream {1, rows, channels} vs
+        // heads-first {1, channels, rows}), so the limit checks swap with it.
+        (ctx->device->disable_p021_mr
+            ? (src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
+               src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2])
+            : (src0->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
+               src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]))) {
         ggml_vk_mul_mat_vec_p021_f16_f32(ctx, subctx, cgraph, node_idx);
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && dst->ne[1] == 1 &&
                !ggml_is_permuted(src0) && !ggml_is_permuted(src1) &&

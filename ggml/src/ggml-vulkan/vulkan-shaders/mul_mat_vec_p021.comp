@@ -25,6 +25,7 @@ layout (push_constant) uniform parameter
     uint b_offset;
     uint d_offset;
     uint fusion_flags;
+    uint swap_yz;
 } p;
 
 #if !USE_SUBGROUP_ADD
@@ -33,7 +34,20 @@ shared FLOAT_TYPE tmp[8][BLOCK_SIZE];
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
-    const uint row_x = gl_GlobalInvocationID.y;
+
+    // Upstream dispatches workgroups as {1, rows, channels}, so consecutive workgroups
+    // differ in row_x and each reads BLOCK_SIZE*2 bytes a whole channel stride apart ->
+    // the cache is swept once per head and decode collapses with context depth.
+    // With swap_yz the grid is {1, channels, rows} and consecutive workgroups read
+    // contiguous memory instead. Same work per workgroup, different visit order.
+    uint row_x, cid;
+    if (p.swap_yz != 0) {
+        row_x = gl_GlobalInvocationID.z;
+        cid   = gl_GlobalInvocationID.y;
+    } else {
+        row_x = gl_GlobalInvocationID.y;
+        cid   = gl_GlobalInvocationID.z;
+    }
 
     uint channel, channel_x;
 
@@ -42,10 +56,10 @@ void main() {
     // rows in the B matrix are [channel, channel+gqa_ratio).
     // When gpa_ratio is 1, each invocation does one row.
     if (gqa_ratio > 1) {
-        channel_x = gl_GlobalInvocationID.z;
+        channel_x = cid;
         channel = channel_x * gqa_ratio;
     } else {
-        channel = gl_GlobalInvocationID.z;
+        channel = cid;
         channel_x = channel / (p.nchannels_y / p.nchannels_x);;
     }
 

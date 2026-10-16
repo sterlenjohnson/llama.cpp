@@ -39,6 +39,8 @@ struct vk_mat_vec_p021_push_constants {
     uint32_t b_offset;
     uint32_t d_offset;
     uint32_t fusion_flags;
+    // 0 = upstream grid {1, rows, channels}; 1 = heads-first grid {1, channels, rows}
+    uint32_t swap_yz;
 };
 
 struct vk_mat_vec_nc_push_constants {
