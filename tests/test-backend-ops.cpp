@@ -12406,6 +12406,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // RDNA1 decode attention (OLMoE: 16 heads x 128, no GQA; Qwen-class: GQA 4)
+    for (ggml_type tkv : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t kv : {2048, 8192, 16384}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 16, {1, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+        }
+    }
+
+    // RDNA1 decode shapes (Ternary Bonsai 27B q2_0, Ornith 9B q4_K/q5_K/q6_K, OLMoE)
+    for (ggml_type t : {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        for (auto mk : std::vector<std::array<int64_t,2>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144}, {1024, 5120}, {1024, 4096}, {2048, 5120}, {1056, 5120}, {48, 5120},
+                                                          {12288, 4096}, {4096, 12288}, {4096, 4096}, {8192, 4096}}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk[0], 1, mk[1], {1, 1}, {1, 1}));
+        }
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
