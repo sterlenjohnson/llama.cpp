@@ -1,0 +1,101 @@
+#version 450
+
+// Integer-dot mat-vec for Q1_0 (1 bit per weight, w = d * (2*bit - 1), 128 weights + f16 scale per block).
+//
+// B is the q8_1_x4 vector produced by quantize_q8_1 with Q1T defined: inside every 32-activation
+// q8_1 block the int8 values are stored in bit-plane order, i.e. byte i of qs word j holds
+// activation j + 8*i. A 32-bit word of Q1_0 bits then dots against qs word j as
+// dot4((bits >> j) & 0x01010101, qs[j]) with no per-row byte shuffling.
+//
+// Each invocation owns one q8_1 block (32 weights, a quarter of a Q1_0 block) per iteration, so rows of
+// k = 4096/5120/... split evenly over a 32-wide workgroup, and reuses the B registers for every row of
+// the workgroup. sum(w*b) = d_a * (2 * d_b * isum - s_b) per q8_1 block.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_integer_dot_product : require
+
+#define MMQ
+#define B_TYPE block_q8_1_x4
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// raw 16-bit view of A: a Q1_0 block is 9 halfwords: [d][qs0..qs7]
+layout (binding = 0) readonly buffer A_U16 {uint16_t data_a_u16[];};
+
+uint a_offset, b_offset, d_offset;
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    const uint tid = gl_LocalInvocationID.x;
+
+    get_offsets(a_offset, b_offset, d_offset);
+    // a_offset is in Q1_0 blocks, b_offset in elements
+    b_offset /= QUANT_K_Q8_1;
+
+    const uint blocks_per_row = p.ncols / QUANT_K;   // ncols is a multiple of 128 for Q1_0
+
+    FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            temp[j][n] = FLOAT_TYPE(0.0f);
+        }
+    }
+
+    // one q8_1 block (32 weights, a quarter of a Q1_0 block) per invocation per iteration
+    const uint qblocks_per_row = p.ncols / QUANT_K_Q8_1;
+    for (uint iq = tid; iq < qblocks_per_row; iq += BLOCK_SIZE) {
+        const uint ib = iq / 4u;            // Q1_0 block
+        const uint hw = (iq % 4u) * 2u;     // halfword offset of this 32-weight quarter inside qs
+
+        uint  abits[NUM_ROWS];
+        float ad[NUM_ROWS];
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            if (n < num_rows) {
+                const uint h = (a_offset + (first_row + n) * blocks_per_row + ib) * 9u;
+                ad[n] = unpackHalf2x16(uint(data_a_u16[h])).x;
+                abits[n] = uint(data_a_u16[h + 1u + hw]) | (uint(data_a_u16[h + 2u + hw]) << 16);
+            } else {
+                ad[n] = 0.0f;
+                abits[n] = 0u;
+            }
+        }
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint qb = (j*p.batch_stride_b) / QUANT_K_Q8_1 + b_offset + iq;
+            const uint outer = qb / 4u;
+            const uint inner = qb % 4u;
+            const vec2 ds = vec2(data_b[outer].ds[inner]);
+            int32_t bq[8];
+            [[unroll]] for (uint k = 0; k < 8; ++k) {
+                bq[k] = data_b[outer].qs[inner * 8u + k];
+            }
+
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                const uint bits = abits[n];
+                int32_t q = 0;
+                [[unroll]] for (uint k = 0; k < 8; ++k) {
+                    q += dotPacked4x8EXT(int32_t((bits >> k) & 0x01010101u), bq[k]);
+                }
+                // sum((2*bit-1)*b) = 2*d_b*isum - s_b
+                temp[j][n] += FLOAT_TYPE(ad[n] * fma(float(2 * q), ds.x, -ds.y));
+            }
+        }
+    }
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}

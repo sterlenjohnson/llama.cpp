@@ -1,0 +1,99 @@
+#version 450
+
+// Integer-dot mat-vec for Q4_0 (w = d * (q - 8), 32 weights + f16 scale = 18 bytes per block),
+// RDNA1-oriented replacement for the generic mul_mat_vecq Q4_0 path.
+//
+// The generic path gives each invocation 8 weights per iteration and, on AMD RDNA, one row per
+// workgroup, so every 8 weights cost a fresh B load (2 words + scales) and an f16 scale load.
+// Here each invocation owns one whole Q4_0 block (= one q8_1 block of B, natural order) per
+// iteration and reuses the B registers for every row of the workgroup:
+// low nibbles of qs word w are weights 4w..4w+3 (B word w), high nibbles weights 16+4w.. (B word 4+w).
+// sum(w*b) = d_a * (d_b * isum - 8 * s_b).
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_integer_dot_product : require
+
+#define MMQ
+#define B_TYPE block_q8_1_x4
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// raw 16-bit view of A: a Q4_0 block is 9 halfwords: [d][qs0..qs7]
+layout (binding = 0) readonly buffer A_U16 {uint16_t data_a_u16[];};
+
+uint a_offset, b_offset, d_offset;
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    const uint tid = gl_LocalInvocationID.x;
+
+    get_offsets(a_offset, b_offset, d_offset);
+    // a_offset is in Q4_0 blocks, b_offset in elements
+    b_offset /= QUANT_K_Q8_1;
+
+    const uint blocks_per_row = p.ncols / QUANT_K;   // ncols is a multiple of 32 for Q4_0
+
+    FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            temp[j][n] = FLOAT_TYPE(0.0f);
+        }
+    }
+
+    for (uint ib = tid; ib < blocks_per_row; ib += BLOCK_SIZE) {
+        uint  abits[NUM_ROWS][4];
+        float ad[NUM_ROWS];
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            if (n < num_rows) {
+                const uint h = (a_offset + (first_row + n) * blocks_per_row + ib) * 9u;
+                ad[n] = unpackHalf2x16(uint(data_a_u16[h])).x;
+                [[unroll]] for (uint w = 0; w < 4; ++w) {
+                    abits[n][w] = uint(data_a_u16[h + 1u + 2u*w]) | (uint(data_a_u16[h + 2u + 2u*w]) << 16);
+                }
+            } else {
+                ad[n] = 0.0f;
+                [[unroll]] for (uint w = 0; w < 4; ++w) {
+                    abits[n][w] = 0u;
+                }
+            }
+        }
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint qb = (j*p.batch_stride_b) / QUANT_K_Q8_1 + b_offset + ib;
+            const uint outer = qb / 4u;
+            const uint inner = qb % 4u;
+            const vec2 ds = vec2(data_b[outer].ds[inner]);
+            int32_t bq[8];
+            [[unroll]] for (uint k = 0; k < 8; ++k) {
+                bq[k] = data_b[outer].qs[inner * 8u + k];
+            }
+
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                int32_t q = 0;
+                [[unroll]] for (uint w = 0; w < 4; ++w) {
+                    const uint bits = abits[n][w];
+                    q += dotPacked4x8EXT(int32_t(bits & 0x0F0F0F0Fu), bq[w]);
+                    q += dotPacked4x8EXT(int32_t((bits >> 4) & 0x0F0F0F0Fu), bq[4u + w]);
+                }
+                temp[j][n] += FLOAT_TYPE(ad[n] * fma(float(q), ds.x, -8.0f * ds.y));
+            }
+        }
+    }
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}

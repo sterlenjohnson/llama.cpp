@@ -57,7 +57,26 @@ void quantize(const uint wgid) {
 
     const uint a_idx = ib * 8 + iqs;
 
+#ifdef Q1T
+    // bit-plane order for the Q1_0 mat-vec: word iqs holds activations iqs, iqs+8, iqs+16, iqs+24
+    // (amax and sum do not depend on the order)
+    const uint c = iqs % 4;
+    const uint v0 = ib * 8 + iqs / 4;
+    vec4 vals = vec4(v0     < p.ne / 4 ? data_a[v0    ][c] : 0.0f,
+                     v0 + 2 < p.ne / 4 ? data_a[v0 + 2][c] : 0.0f,
+                     v0 + 4 < p.ne / 4 ? data_a[v0 + 4][c] : 0.0f,
+                     v0 + 6 < p.ne / 4 ? data_a[v0 + 6][c] : 0.0f);
+#elif defined(Q2T)
+    // stride-4 order for the Q2_0 mat-vec: word 4*g + t holds activations 16*g + t + 4*i
+    const uint c = iqs % 4;
+    const uint v0 = ib * 8 + (iqs / 4) * 4;
+    vec4 vals = vec4(v0     < p.ne / 4 ? data_a[v0    ][c] : 0.0f,
+                     v0 + 1 < p.ne / 4 ? data_a[v0 + 1][c] : 0.0f,
+                     v0 + 2 < p.ne / 4 ? data_a[v0 + 2][c] : 0.0f,
+                     v0 + 3 < p.ne / 4 ? data_a[v0 + 3][c] : 0.0f);
+#else
     vec4 vals = a_idx < p.ne / 4 ? data_a[a_idx] : vec4(0.0f);
+#endif
     const vec4 abs_vals = abs(vals);
 
     // Find absolute max for each block

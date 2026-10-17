@@ -787,6 +787,12 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    vk_pipeline pipeline_quantize_q8_1_x4_q1t; // bit-plane order for the Q1_0 MMVQ
+    vk_pipeline pipeline_quantize_q8_1_x4_q2t; // stride-4 order for the Q2_0 "t" MMVQ
+    vk_pipeline pipeline_mmvq_q2_0t_f32[DMMV_WG_SIZE_COUNT][mul_mat_vec_max_cols];
+    vk_pipeline pipeline_mmvq_id_q2_0t_f32[DMMV_WG_SIZE_COUNT];
+    vk_pipeline pipeline_mmvq_q4_0t_f32[DMMV_WG_SIZE_COUNT][mul_mat_vec_max_cols];
+    vk_pipeline pipeline_mmvq_id_q4_0t_f32[DMMV_WG_SIZE_COUNT];
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -1016,6 +1022,17 @@ struct vk_device_struct {
     // the cache once per head. With channels fastest-varying the same reads are
     // contiguous. Set GGML_VK_DISABLE_P021_MR to restore the upstream order.
     bool disable_p021_mr;
+    // Integer-dot (MMVQ) mat-vec for Q1_0: bit planes against a byte-transposed q8_1 vector.
+    // Upstream has no Q1_0 MMVQ and its float DMMV is ALU-bound (~60 GB/s on RDNA1).
+    // GGML_VK_DISABLE_Q1_0_MMVQ restores the upstream DMMV path.
+    bool disable_q1_0_mmvq;
+    // Q2_0 MMVQ with stride-4 ordered q8_1 (shift/and/dot4 per 4 weights, one lane per block).
+    // GGML_VK_DISABLE_Q2_0_MMVQ_T restores the upstream Q2_0 MMVQ.
+    bool disable_q2_0_mmvq_t;
+    // Q4_0 MMVQ with one lane per block and B reused over rows. GGML_VK_DISABLE_Q4_0_MMVQ_T restores upstream.
+    bool disable_q4_0_mmvq_t;
+    uint32_t fa_split_k_mult; // tuning aid: forces the FA split_k occupancy multiplier (0 = auto)
+    bool disable_fa_qsplit;   // GGML_VK_DISABLE_FA_QSPLIT: no extra FA split_k for quantized KV on RDNA1
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
