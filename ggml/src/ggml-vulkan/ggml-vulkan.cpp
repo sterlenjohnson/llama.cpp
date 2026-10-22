@@ -2916,6 +2916,28 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         rm_stdq = 2;
         rm_stdq_int = 2;
     }
+    // GGML_VK_MMVQ_ROWS=N: the rows one integer mat-vec workgroup computes.
+    //
+    // The rows per workgroup is the same lever upstream measures on its own kernels
+    // (Strata 0.1.47's STRATA_B6_MMVQ_ROWS: "row chunks per block so the staged codebook
+    // is paid once per several rows"), and on this card it is worth a look because the 35B's
+    // decode is q6_K dense matvecs (58.5 ms of a 64.9 ms token, at 145-183 GB/s against the
+    // card's 390 GB/s ceiling).  More rows per workgroup means fewer workgroups for the same
+    // rows: less launch overhead and more memory parallelism, at the cost of the reduction's
+    // shared memory and of the tail handling (the shader takes the last workgroup's rows
+    // one at a time).
+    if (const char * env = std::getenv("GGML_VK_MMVQ_ROWS")) {
+        const int rows = std::atoi(env);
+        if (rows >= 1 && rows <= 8) {
+            rm_stdq_int = rows;
+            rm_kq_int   = rows;
+            GGML_LOG_INFO("%s: GGML_VK_MMVQ_ROWS=%d - %u rows per workgroup in the integer mat-vecs\n",
+                          __func__, rows, rows);
+        }
+    }
+    // (measured on the 5600M, the 35B's decode, 2 interleaved reps each: rows 1/2/4 read
+    // 19.12/19.68, 18.96/19.26 and 18.47/19.34 tok/s - inside the noise, rows=1 marginally
+    // best.  The q6_K matvecs are not limited by the workgroup's row count here.)
     // RDNA3/4: above four columns, static 4 rows for all types bench faster than the default
     const bool is_rdna3_or_4 = device->vendor_id == VK_VENDOR_ID_AMD && (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
     auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3_or_4 && i >= 4) ? 4u : rows; };
