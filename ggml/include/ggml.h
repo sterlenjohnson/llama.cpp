@@ -750,6 +750,7 @@ extern "C" {
     GGML_API int64_t ggml_hp_now(void);
     GGML_API void    ggml_hp_add(int slot, int64_t t0_ns);
     GGML_API void    ggml_hp_report(void);
+    GGML_API void    ggml_hp_report_phase(const char * label);
     GGML_API int64_t ggml_cycles(void);
     GGML_API int64_t ggml_cycles_per_ms(void);
 

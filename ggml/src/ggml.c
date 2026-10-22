@@ -641,6 +641,25 @@ void ggml_hp_report(void) {
     }
 }
 
+void ggml_hp_report_phase(const char * label) {
+    if (!ggml_hp_on() || ggml_hp_n[0] == 0) {
+        return;
+    }
+    const double nt = (double) ggml_hp_n[0];
+    fprintf(stderr, "ggml_hp: %s (n=%.0f batches), inclusive ms and calls/batch\n", label, nt);
+    for (int i = 0; i < GGML_HP_SLOTS; i++) {
+        if (ggml_hp_n[i] == 0) {
+            continue;
+        }
+        fprintf(stderr, "ggml_hp: %-22s %8.3f ms/batch  %7.1f calls/batch\n", ggml_hp_names[i], ggml_hp_ns[i]/1e6/nt, ggml_hp_n[i]/nt);
+    }
+    // the next phase starts from zero
+    for (int i = 0; i < GGML_HP_SLOTS; i++) {
+        ggml_hp_ns[i] = 0;
+        ggml_hp_n[i]  = 0;
+    }
+}
+
 int64_t ggml_cycles(void) {
     return clock();
 }

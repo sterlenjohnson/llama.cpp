@@ -1846,7 +1846,9 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
-    ggml_hp_active(batch_inp.tokens.size() == 1);
+    // the profiler covers the prompt phase as well as the decode: a phase report
+    // is printed when a multi-token batch ends, and the counters restart there
+    ggml_hp_active(true);
     GGML_HP(GGML_HP_DECODE);
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2245,6 +2247,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (batch_inp.tokens.size() > 1) {
+        ggml_hp_report_phase("prompt phase");
+    }
 
     return 0;
 }
