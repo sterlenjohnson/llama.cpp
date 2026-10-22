@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -339,10 +340,21 @@ struct llama_moe_cache::impl {
     std::vector<int32_t> ids;
     std::vector<moe_cache_slru::fill> fills;
 
+    // LLAMA_MOE_CACHE_SYNC_LEGACY=1: slot maps and ids in pageable memory and a scheduler-style synchronization before the
+    // readback, this is the old path, kept for A/B comparisons
+    // otherwise the slot maps and the ids are in the pinned host buffer of the GPU, so the readback of the ids and the copy
+    // of the slot map are plain async copies, the only blocking wait of a cached layer is the readback of its ids
+    bool sync_legacy = false;
+
     // slot maps in host memory
     ggml_context_ptr ctx_host;
     ggml_backend_buffer_ptr buf_host;
     size_t buf_host_size = 0;
+
+    // pinned destination of the ids readback, nullptr in the legacy path
+    ggml_backend_buffer_ptr buf_ids;
+    int32_t * ids_pinned = nullptr;
+    size_t    ids_pinned_n = 0;
 
     // views used by copy_experts
     ggml_context_ptr ctx_views;
@@ -350,6 +362,10 @@ struct llama_moe_cache::impl {
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, const char * profile_path, const char * profile_save_path) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), profile_path(profile_path), profile_save_path(profile_save_path), profile_loaded(false) {
         (void) profile_path;
+        {
+            const char * env = getenv("LLAMA_MOE_CACHE_SYNC_LEGACY");
+            sync_legacy = env != nullptr && atoi(env) != 0;
+        }
         n_layers = (int32_t) model.layers.size();
         n_expert = (int32_t) model.hparams.n_expert;
         expert_counts.assign((size_t)n_layers * n_expert, 0);
@@ -488,7 +504,14 @@ struct llama_moe_cache::impl {
         ctx_host  = init_ctx(n_tensors_host);
         ctx_views = init_ctx(2);
 
+        // the pinned host buffer of the first GPU, so that the backend can copy the slot maps without staging them
         ggml_backend_buffer_type_t buft_host = ggml_backend_cpu_buffer_type();
+        if (!sync_legacy) {
+            ggml_backend_buffer_type_t buft_pinned = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(devices[0].backend));
+            if (buft_pinned != nullptr) {
+                buft_host = buft_pinned;
+            }
+        }
         const size_t alignment_host = ggml_backend_buft_get_alignment(buft_host);
 
         for (size_t ig = 0; ig < groups.size(); ++ig) {
@@ -562,6 +585,17 @@ struct llama_moe_cache::impl {
                     }
                 }
             }
+
+            // the ids of a ubatch that uses the cache: at most max_batch tokens, see get_slot_map
+            if (!sync_legacy && buft_host != ggml_backend_cpu_buffer_type()) {
+                ids_pinned_n = (size_t) max_batch*n_expert_used;
+                buf_ids.reset(ggml_backend_buft_alloc_buffer(buft_host, ids_pinned_n*sizeof(int32_t)));
+                if (buf_ids) {
+                    ids_pinned = (int32_t *) ggml_backend_buffer_get_base(buf_ids.get());
+                } else {
+                    ids_pinned_n = 0;
+                }
+            }
         }
 
         {
@@ -603,8 +637,9 @@ struct llama_moe_cache::impl {
             if (d.host_bytes == 0) {
                 continue;
             }
-            LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts\n", __func__,
-                ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0);
+            LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts, slot maps in %s%s\n", __func__,
+                ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0,
+                ggml_backend_buft_name(buft_host), sync_legacy ? " (LLAMA_MOE_CACHE_SYNC_LEGACY)" : "");
             for (const group & g : groups) {
                 if (g.id == (int32_t) id) {
                     LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%)\n", __func__,
@@ -875,20 +910,36 @@ struct llama_moe_cache::impl {
         }
         GGML_ASSERT(ggml_is_contiguous(sel));
 
-        ids.resize(ggml_nelements(sel));
-        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+        // the scheduler does not synchronize the backend before it calls back (see ggml_backend_sched_copy_input),
+        // the legacy path does it here, as the scheduler did
+        if (sync_legacy) {
+            ggml_backend_synchronize(backend);
+        }
+
+        // this synchronization waits for the split that selects the experts and for all the earlier work of the backend:
+        // the uploads below overwrite slots that earlier splits may read, and the slot maps, which the backend reads
+        // from pinned memory when it executes their copies, are changed by plan
+        const size_t n_ids = ggml_nelements(sel);
+        int32_t * ids_data;
+        if (ids_pinned != nullptr && n_ids <= ids_pinned_n) {
+            ids_data = ids_pinned;
+        } else {
+            ids.resize(n_ids);
+            ids_data = ids.data();
+        }
+        ggml_backend_tensor_get_async(backend, sel, ids_data, 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
 
         size_t n_hit = 0;
-        if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
+        if (!g.slru.plan(il, ids_data, n_ids, fills, n_hit)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
         // profile capture: count distinct selected experts for this layer
         if (il >= 0 && il < n_layers && expert_counts.size() == (size_t)n_layers * n_expert) {
             // distinct
             std::vector<char> seen_e(n_expert, 0);
-            for (size_t i = 0; i < ids.size(); ++i) {
-                int32_t e = ids[i];
+            for (size_t i = 0; i < n_ids; ++i) {
+                int32_t e = ids_data[i];
                 if (e >= 0 && e < n_expert && !seen_e[e]) {
                     seen_e[e] = 1;
                     expert_counts[(size_t)il * n_expert + e]++;
@@ -913,12 +964,13 @@ struct llama_moe_cache::impl {
             }
         }
 
-        stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+        stats & st = n_ids <= (size_t) 8*n_expert_used ? stats_small : stats_large;
         st.hits   += n_hit;
         st.misses += fills.size();
         st.bytes  += bytes;
 
         // the next copy synchronizes the backend before it changes the slot map again
+        // the backend reads a pinned slot map when the copy executes (Vulkan stages and synchronizes a pageable one here)
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
 
         return true;

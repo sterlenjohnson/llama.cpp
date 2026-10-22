@@ -2796,6 +2796,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         return false;
     }
 
+    // without pipeline parallelism the scheduler calls back before it synchronizes the backend, do it here as it did
+    if (!lctx->cparams.pipeline_parallel) {
+        ggml_backend_synchronize(backend);
+    }
+
     const ggml_tensor * ids = node->src[2];
     if (ggml_nelements(ids) == 0) {
         return true;

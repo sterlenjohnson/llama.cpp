@@ -1837,14 +1837,27 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         return;
     }
 
+    const bool has_event = sched->events[split_backend_id][sched->cur_copy] != NULL;
+    const bool use_callback = sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input);
+
+    // without events the wait below is a full synchronization of the split backend
+    // the callback is called before it, so that it can merge it with its own synchronization:
+    // a callback that returns true must synchronize the split backend itself before it writes to input_cpy or to anything
+    // the earlier splits may still read, if it returns false the scheduler synchronizes and copies as usual
+    // with events, the callback is called after the split backend was made to wait for the event, as before
+    if (use_callback && !has_event &&
+        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+        return;
+    }
+
     // wait for the split backend to finish using the input before overwriting it
-    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+    if (has_event) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
     } else {
         ggml_backend_synchronize(split_backend);
     }
 
-    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
+    if (use_callback && has_event &&
         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
         return;
     }
