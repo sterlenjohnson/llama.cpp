@@ -592,7 +592,7 @@ static const char * ggml_hp_names[GGML_HP_SLOTS] = {
     "decode", "process_ubatch", "build+alloc", "set_inputs", "graph_compute", "sched_copy_input", "moe_copy_cb",
     "moe_plan", "vk_graph_compute", "vk_synchronize", "vk_fence_wait", "logits_extract", "cpu_graph_compute",
     "sample", "sched_prev_sync", "moe_ids_get+sync", "vk_build_graph", "vk_tensor_get_async", "vk_tensor_set_async",
-    "llama_synchronize", "sched_compute_splits", "vk_flops_per_node", "vk_fusion_chain", "vk_submit_after", "slot24", "slot25", "slot26",
+    "llama_synchronize", "sched_compute_splits", "vk_flops_per_node", "vk_fusion_chain", "vk_submit_after", "moe_cb_sync", "moe_cb_ids", "moe_cb_issue",
     "slot27", "slot28", "slot29", "slot30", "slot31"
 };
 

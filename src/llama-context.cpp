@@ -2903,6 +2903,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     // without pipeline parallelism the scheduler calls back before it synchronizes the backend, do it here as it did
     if (!lctx->cparams.pipeline_parallel) {
+        GGML_HP(GGML_HP_MOE_CB_SYNC);
         ggml_backend_synchronize(backend);
     }
 
@@ -2918,6 +2919,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     const int pcie_prev = ggml_backend_pcie_set_tag(GGML_PCIE_EXPERT_LARGE);
 
     if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
+        GGML_HP(GGML_HP_MOE_CB_IDS);
         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
         ggml_backend_pcie_set_tag(GGML_PCIE_IDS);
         ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
@@ -2937,6 +2939,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     }
 
     // group consecutive experts and copy them together
+    GGML_HP(GGML_HP_MOE_CB_ISSUE);
     for (int64_t first = 0; first < n_expert; ) {
         if (!st.used[first]) {
             first++;
