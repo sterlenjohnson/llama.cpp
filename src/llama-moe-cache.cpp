@@ -7,8 +7,13 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
+#include <unordered_set>
+#include <fstream>
+#include <cstring>
+#include <cstdint>
 
 namespace {
 
@@ -31,6 +36,39 @@ struct moe_cache_slru {
     std::vector<uint32_t> seen; // [n_expert]
     uint32_t seen_gen = 0;
     std::vector<int32_t> uniq;
+    std::unordered_set<int32_t> hot_keys;
+    std::vector<int32_t> layer_quota; // per-layer slot cap; 0 = unlimited
+    void set_hot(const std::vector<std::pair<int32_t,int32_t>>& ranked, int32_t n_expert_) {
+        hot_keys.clear();
+        for (const auto & pr : ranked) {
+            hot_keys.insert(pr.first * n_expert_ + pr.second);
+        }
+    }
+    // keep only the top `per_layer` pairs of each layer hot: the hot set has to
+    // be SMALLER than the layer's quota, or the layer has no room left for the
+    // experts the routing touches cold, and a cold request then has to evict a
+    // hot one - the opposite of what the profile is for.
+    void set_hot_top(const std::vector<std::pair<int32_t,int32_t>>& ranked, int32_t n_expert_, int32_t per_layer, int32_t n_layer_) {
+        hot_keys.clear();
+        std::vector<int32_t> taken((size_t) n_layer_, 0);
+        for (const auto & pr : ranked) {
+            if (pr.first < 0 || pr.first >= n_layer_) continue;
+            if (taken[pr.first] >= per_layer) continue;
+            taken[pr.first]++;
+            hot_keys.insert(pr.first * n_expert_ + pr.second);
+        }
+    }
+    void set_quotas(const std::vector<int32_t>& q) {
+        layer_quota = q;
+    }
+    int32_t count_slots_layer(int32_t il) const {
+        if (il < 0 || il >= (int32_t) slot_map.size() || !slot_map[il]) return 0;
+        int32_t c = 0;
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (slot_map[il][e] >= 0) ++c;
+        }
+        return c;
+    }
 
     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
         this->n_expert = n_expert;
@@ -85,12 +123,62 @@ struct moe_cache_slru {
         }
     }
 
+    // a slot may be evicted if it is empty, holds an expert of another layer, or
+    // holds an expert that this request did not select - including the earlier
+    // fills of the same request
+    bool evictable(int32_t s, int32_t il) const {
+        const int32_t key = key_of[s];
+        if (key < 0) {
+            return true;
+        }
+        return key / n_expert != il || seen[key % n_expert] != seen_gen;
+    }
+
+    // The SLRU's own order: the probation segment first, then the protected one,
+    // and inside a segment the least recently used first.
+    //
+    // Two refinements ride on that order and never change it:
+    //  - the expert profile's hot set is evicted only when there is nothing else
+    //    to evict, so a hot expert survives a cold request while it can;
+    //  - the per-layer quota makes a layer that is at its share of the slots
+    //    evict one of its own cold slots first, so one layer cannot eat another's.
+    //
+    // Neither refinement may refuse an eviction the plain SLRU would have made:
+    // they only change WHICH slot is chosen, and the last pass is upstream's rule
+    // unchanged.  With no profile and no quota this is upstream's victim() exactly.
     int32_t victim(int32_t il) const {
+        const bool at_quota = (il >= 0 && il < (int32_t) layer_quota.size() && layer_quota[il] > 0 &&
+                               count_slots_layer(il) >= layer_quota[il]);
+        // 1. the layer's own cold slot, when the layer is at its quota
+        if (at_quota) {
+            for (int segment = 0; segment < 2; ++segment) {
+                for (int32_t s = head[segment]; s >= 0; s = next[s]) {
+                    const int32_t key = key_of[s];
+                    if (key < 0 || key / n_expert != il || !evictable(s, il)) {
+                        continue;
+                    }
+                    if (!hot_keys.count(key)) {
+                        return s;
+                    }
+                }
+            }
+        }
+        // 2. the coldest slot that is not hot
         for (int segment = 0; segment < 2; ++segment) {
             for (int32_t s = head[segment]; s >= 0; s = next[s]) {
                 const int32_t key = key_of[s];
-                // keep every expert selected by this request, including earlier fills
-                if (key < 0 || key / n_expert != il || seen[key % n_expert] != seen_gen) {
+                if (!evictable(s, il)) {
+                    continue;
+                }
+                if (key < 0 || !hot_keys.count(key)) {
+                    return s;
+                }
+            }
+        }
+        // 3. upstream's rule: the coldest slot this request did not select
+        for (int segment = 0; segment < 2; ++segment) {
+            for (int32_t s = head[segment]; s >= 0; s = next[s]) {
+                if (evictable(s, il)) {
                     return s;
                 }
             }
@@ -230,6 +318,13 @@ struct llama_moe_cache::impl {
     static constexpr int64_t max_batch = 32;
 
     int32_t n_expert_used;
+    int32_t n_layers = 0;
+    int32_t n_expert = 0;
+    std::vector<std::pair<int32_t,int32_t>> profile_ranked;
+    const char * profile_path = nullptr;
+    const char * profile_save_path = nullptr;
+    bool profile_loaded = false;
+    std::vector<uint64_t> expert_counts;
 
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
@@ -252,8 +347,15 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
-            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
+    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, const char * profile_path, const char * profile_save_path) :
+            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), profile_path(profile_path), profile_save_path(profile_save_path), profile_loaded(false) {
+        (void) profile_path;
+        n_layers = (int32_t) model.layers.size();
+        n_expert = (int32_t) model.hparams.n_expert;
+        expert_counts.assign((size_t)n_layers * n_expert, 0);
+        LLAMA_LOG_INFO("%s: size = %.1f MiB, n_expert = %d, n_expert_used = %d, n_layer = %zu\n",
+                       __func__, size/1024.0/1024.0, model.hparams.n_expert, n_expert_used, layers.size());
+        // bounded step: profile loading is deferred (see ensure_profile_loaded), to avoid dangling pointers during fit.
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -358,6 +460,7 @@ struct llama_moe_cache::impl {
                 continue;
             }
             g.slru.init(model.layers.size(), n_expert, g.n_slots);
+            g.slru.set_hot(profile_ranked, n_expert);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size();
         }
@@ -461,6 +564,32 @@ struct llama_moe_cache::impl {
             }
         }
 
+        {
+            size_t slots = 0;
+            size_t slot_bytes = 0;
+            size_t cached_layers = 0;
+            for (const group & g : groups) {
+                if (g.n_slots == 0) {
+                    continue;
+                }
+                slots += (size_t) g.n_slots;
+                cached_layers += g.layers.size();
+                for (const ggml_tensor * t : g.ref) {
+                    slot_bytes += (size_t) t->nb[2] * g.n_slots;
+                }
+            }
+            LLAMA_LOG_INFO("llama_moe_cache: budget = %.1f MiB, %zu slots (%.1f MiB of experts) over %zu layers, "
+                           "host experts = %.1f MiB\n",
+                           size/1024.0/1024.0, slots, slot_bytes/1024.0/1024.0, cached_layers,
+                           [&] {
+                               size_t h = 0;
+                               for (const device & d : devices) {
+                                   h += d.host_bytes;
+                               }
+                               return h/1024.0/1024.0;
+                           }());
+        }
+
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
         for (device & d : devices) {
             if (d.buf) {
@@ -480,6 +609,12 @@ struct llama_moe_cache::impl {
                 if (g.id == (int32_t) id) {
                     LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%)\n", __func__,
                         g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]));
+                    // the layers the cache covers, so an expert profile can be pruned to them
+                    std::string ls;
+                    for (size_t i = 0; i < g.layers.size(); ++i) {
+                        ls += (i ? "," : "") + std::to_string(g.layers[i]);
+                    }
+                    LLAMA_LOG_INFO("%s:   cached layers: %s\n", __func__, ls.c_str());
                 }
             }
         }
@@ -491,6 +626,35 @@ struct llama_moe_cache::impl {
 
     ~impl() {
         log_stats();
+        if (profile_save_path) {
+            // write STRP profile: rank (layer,expert) by count descending
+            std::vector<std::pair<uint64_t,int32_t>> ranked; // count, index
+            const size_t total = (size_t)n_layers * n_expert;
+            for (size_t idx = 0; idx < total; ++idx) {
+                if (expert_counts[idx] > 0) ranked.push_back({expert_counts[idx], (int32_t)idx});
+            }
+            std::sort(ranked.begin(), ranked.end(), [](const auto & a, const auto & b){ return a.first > b.first; });
+            std::FILE * f = std::fopen(profile_save_path, "wb");
+            if (f) {
+                const char magic[4] = {'S','T','R','P'};
+                std::fwrite(magic,1,4,f);
+                uint32_t hdr[5] = {1, (uint32_t)n_layers, (uint32_t)n_expert, (uint32_t)ranked.size(), (uint32_t)ranked.size()};
+                std::fwrite(hdr,4,5,f);
+                std::vector<uint16_t> raw;
+                raw.reserve(ranked.size()*2);
+                for (const auto & r : ranked) {
+                    int32_t l = r.second / n_expert;
+                    int32_t e = r.second % n_expert;
+                    raw.push_back((uint16_t)l);
+                    raw.push_back((uint16_t)e);
+                }
+                if (!raw.empty()) std::fwrite(raw.data(),2,raw.size(),f);
+                std::fclose(f);
+                fprintf(stderr, "moe_cache: saved profile %s: %zu ranked pairs\n", profile_save_path, ranked.size());
+            } else {
+                fprintf(stderr, "moe_cache: could not save profile %s\n", profile_save_path);
+            }
+        }
     }
 
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
@@ -509,6 +673,137 @@ struct llama_moe_cache::impl {
     ggml_tensor * get_experts(const ggml_tensor * w) const {
         const auto it = bindings.find(w);
         return it != bindings.end() ? it->second.cached : nullptr;
+    }
+
+    void ensure_profile_loaded() {
+        if (profile_loaded || !profile_path) return;
+        profile_loaded = true;
+        std::string profile_str = profile_path;
+        std::FILE * f = std::fopen(profile_str.c_str(), "rb");
+        if (!f) {
+            fprintf(stderr, "moe_cache: could not open profile %s\n", profile_str.c_str());
+            return;
+        }
+        char magic[4]={0,0,0,0};
+        uint32_t hdr[5]={0,0,0,0,0};
+        if (std::fread(magic,1,4,f)!=4 || std::fread(hdr,4,5,f)!=5 || memcmp(magic,"STRP",4)!=0) {
+            std::fclose(f); return;
+        }
+        const uint32_t nl=hdr[1], ne=hdr[2], n_ranked=hdr[4];
+        // The profile may cover FEWER layers than the model has.  The engine
+        // counts the MTP head as a layer: the 35B has 40 trunk layers plus
+        // blk.40.nextn (qwen35moe.nextn_predict_layers = 1), so model.layers
+        // has 41 entries and n_layer_all prints 41, while a profile built from
+        // the trunk routing has 40.  A profile that names a layer the model
+        // does not have is an error; one that omits the MTP layer is not -
+        // llama.cpp ignores the MTP head's tensors anyway.
+        if ((int64_t)nl > n_layers || (int64_t)ne != n_expert) {
+            fprintf(stderr, "moe_cache: profile is %u layers x %u experts, the model has %d layers x %d experts - not used\n",
+                    nl, ne, n_layers, n_expert);
+            std::fclose(f); return;
+        }
+        profile_ranked.assign(n_ranked, {0,0});
+        std::vector<uint16_t> raw((size_t)n_ranked*2);
+        if (n_ranked==0 || std::fread(raw.data(),2,(size_t)n_ranked*2,f)==(size_t)n_ranked*2) {
+            for (uint32_t i=0;i<n_ranked;i++) {
+                profile_ranked[i] = {(int32_t)raw[(size_t)i*2], (int32_t)raw[(size_t)i*2+1]};
+            }
+            fprintf(stderr, "moe_cache: loaded profile %s: %u ranked pairs\n", profile_str.c_str(), n_ranked);
+        } else {
+            profile_ranked.clear();
+        }
+        std::fclose(f);
+        // count profile pairs per layer
+        std::vector<int32_t> pair_count(n_layers, 0);
+        for (const auto & pr : profile_ranked) {
+            if (pr.first >= 0 && pr.first < n_layers) pair_count[pr.first]++;
+        }
+        for (auto & g : groups) {
+            // size per-layer quotas for this group's layers
+            std::vector<int32_t> quotas(n_layers, 0);
+            int64_t total_pairs = 0;
+            for (int32_t il : g.layers) {
+                if (il >= 0 && il < n_layers) total_pairs += pair_count[il];
+            }
+            if (total_pairs > 0) {
+                // The quota is each layer's SHARE of the slots, scaled by how many
+                // of the profile's pairs belong to that layer.  It must stay a
+                // share and not become the hot count: a layer needs slots for the
+                // experts the routing touches cold as well as for the ones it
+                // touches hot, and a quota equal to the hot count leaves no room
+                // for the cold ones - every cold request then has to evict a hot
+                // expert, which is the opposite of what the profile is for.
+                //
+                // The share is taken over the profile's pairs for the group's
+                // layers, but the quota is floored at the number of hot pairs
+                // that layer can actually hold, and the profile's pairs beyond
+                // the quota stay hot-but-evictable.
+                int32_t remaining = g.n_slots;
+                for (size_t idx = 0; idx < g.layers.size(); ++idx) {
+                    int32_t il = g.layers[idx];
+                    if (il < 0 || il >= n_layers) continue;
+                    int32_t q;
+                    if (idx + 1 == g.layers.size()) {
+                        q = remaining;
+                    } else {
+                        q = (int32_t) ((int64_t) g.n_slots * pair_count[il] / total_pairs);
+                        if (q < 1) q = 1;
+                    }
+                    if (q > remaining) q = remaining;
+                    remaining -= q;
+                    quotas[il] = q;
+                }
+                // give any leftover to the last layer
+                if (!g.layers.empty()) {
+                    int32_t last = g.layers.back();
+                    if (last >= 0 && last < n_layers) quotas[last] += remaining;
+                }
+            } else {
+                // no profile info: uniform split
+                int32_t base = g.n_slots / (int32_t) g.layers.size();
+                int32_t rem = g.n_slots - base * (int32_t) g.layers.size();
+                for (int32_t il : g.layers) {
+                    if (il >= 0 && il < n_layers) {
+                        quotas[il] = base + (rem > 0 ? 1 : 0);
+                        if (rem > 0) --rem;
+                    }
+                }
+            }
+            g.slru.set_quotas(quotas);
+
+            // Now the hot set.  It is the top of the ranking, but capped per
+            // layer so that it stays SMALLER than the layer's quota: the quota
+            // is the layer's share of the slots and the hot set is the part of
+            // that share worth protecting.  The rest of the share is the churn
+            // pool the cold experts cycle through.
+            //
+            // With the profile pruned to the cache's slot count the quota and
+            // the hot count came out EQUAL (the quota is the profile's share of
+            // the slots, and the profile had exactly one slot's worth of pairs),
+            // which left no churn pool at all: every cold request had to evict
+            // a hot expert and the hit rate fell BELOW the plain LRU's.
+            int32_t hot_per_layer = 0;
+            for (int32_t il : g.layers) {
+                if (il >= 0 && il < n_layers) hot_per_layer = std::max(hot_per_layer, quotas[il]);
+            }
+            // keep a FRACTION of each layer's share hot, at least one.
+            // The fraction is tunable because the trade is real: more hot means
+            // better protection of the experts the ranking likes, and less room
+            // for the ones the routing touches cold.
+            {
+                const char * e = getenv("GGML_MOE_HOT_FRACTION");
+                int32_t num = 1, den = 2;
+                if (e) {
+                    const char * sl = strchr(e, '/');
+                    if (sl) { den = atoi(sl+1); num = atoi(e); }
+                    else { num = atoi(e); den = 1; }
+                    if (den < 1) den = 1;
+                    if (num < 0) num = 0;
+                }
+                hot_per_layer = std::max(1, (hot_per_layer * num) / den);
+            }
+            g.slru.set_hot_top(profile_ranked, n_expert, hot_per_layer, n_layers);
+        }
     }
 
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
@@ -547,6 +842,7 @@ struct llama_moe_cache::impl {
     }
 
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+        ensure_profile_loaded();
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
             return false;
@@ -586,6 +882,18 @@ struct llama_moe_cache::impl {
         size_t n_hit = 0;
         if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+        }
+        // profile capture: count distinct selected experts for this layer
+        if (il >= 0 && il < n_layers && expert_counts.size() == (size_t)n_layers * n_expert) {
+            // distinct
+            std::vector<char> seen_e(n_expert, 0);
+            for (size_t i = 0; i < ids.size(); ++i) {
+                int32_t e = ids[i];
+                if (e >= 0 && e < n_expert && !seen_e[e]) {
+                    seen_e[e] = 1;
+                    expert_counts[(size_t)il * n_expert + e]++;
+                }
+            }
         }
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
@@ -633,8 +941,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
-    pimpl(new impl(model, backends, bufts, size)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, const char * profile_path, const char * profile_save_path) :
+    pimpl(new impl(model, backends, bufts, size, profile_path, profile_save_path)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;

@@ -1291,6 +1291,59 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    // --vram-arena auto: size the expert cache from what the card still has free after the
+    // model's weights are placed.  The KV cache and the compute buffers are allocated later,
+    // so the margin (default 768 MiB) plus the KV estimate keeps them out of the arena.
+    if (params.moe_cache_auto) {
+        size_t free_total = 0;
+        int    n_dev       = 0;
+        auto account = [&](ggml_backend_dev_t dev) {
+            const auto type = ggml_backend_dev_type(dev);
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                return;
+            }
+            size_t free = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            free_total += free;
+            ++n_dev;
+        };
+        if (!params.devices.empty()) {
+            for (ggml_backend_dev_t dev : params.devices) {
+                account(dev);
+            }
+        } else {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                account(ggml_backend_dev_get(i));
+            }
+        }
+        // KV is not allocated yet, so estimate it from the requested context and the cache types.
+        // The per-type constants are the measured 35B-A3B figures (K+V, KiB/token, whole card):
+        // f16 21.3, q8_0 10.65, q4_0 5.60 (engine/linux/telemetry/plan.py).
+        auto kv_half_kib = [](ggml_type t) -> double {
+            switch (t) {
+                case GGML_TYPE_F16:  return 10.65;
+                case GGML_TYPE_Q8_0: return 5.325;
+                case GGML_TYPE_Q4_0: return 2.80;
+                default:             return 5.325;
+            }
+        };
+        const int n_ctx = cparams.n_ctx > 0 ? (int) cparams.n_ctx : (int) llama_model_n_ctx_train(model);
+        const double kv_mib = (double) n_ctx * (kv_half_kib(params.cache_type_k) + kv_half_kib(params.cache_type_v)) / 1024.0;
+        const size_t wall_mib = 128;
+        const size_t margin = ((size_t) params.vram_arena_margin_mib + (size_t) (kv_mib + 0.5) + wall_mib) * 1024 * 1024;
+        const size_t arena  = free_total > margin ? free_total - margin : 0;
+        params.moe_cache_size = arena;
+        cparams.moe_cache_size = arena;
+        LOG_INF("vram-arena: auto: free %zu MiB - (compute %d + KV %.0f + wall %zu) MiB = arena %zu MiB over %d GPU device%s\n",
+                free_total / 1024 / 1024, params.vram_arena_margin_mib, kv_mib, wall_mib,
+                arena / 1024 / 1024, n_dev, n_dev == 1 ? "" : "s");
+        if (arena == 0) {
+            LOG_WRN("vram-arena: auto: no room left for an expert cache; pass a smaller "
+                    "--vram-arena-margin-mib or set --vram-arena N explicitly\n");
+        }
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // these decision models return a score for each token via the embeddings output
@@ -1749,6 +1802,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
 
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_cache_profile = params.moe_cache_profile.empty() ? nullptr : params.moe_cache_profile.c_str();
+    cparams.moe_cache_profile_save = params.moe_cache_profile_save.empty() ? nullptr : params.moe_cache_profile_save.c_str();
 
     return cparams;
 }

@@ -2682,7 +2682,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VIDEO_FFMPEG_DIR"));
     add_opt(common_arg(
         {"--rpc"}, "SERVERS",
-        "comma-separated list of RPC servers (host:port)",
+        "comma-separated list of RPC servers (host:port; bracket IPv6 literals, e.g. [::1]:50052)",
         [](common_params & params, const std::string & value) {
             if (!llama_supports_rpc()) {
                 throw std::invalid_argument("RPC not supported in this build");
@@ -2785,8 +2785,69 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value");
             }
             params.moe_cache_size = (size_t) value*1024*1024;
+            params.moe_cache_auto = false;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
+    add_opt(common_arg(
+        {"--moe-cache-profile"}, "PATH",
+        "path to a STRP expert profile (UnbiasedStrata format) used to bias MoE cache eviction toward hot experts; keeps profile-ranked pairs resident longer (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_profile = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PROFILE"));
+    add_opt(common_arg(
+        {"--moe-cache-profile-save"}, "PATH",
+        "save a STRP expert profile captured from this run's routing to PATH (written at exit) [EXPERIMENTAL]",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_profile_save = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PROFILE_SAVE"));
+    add_opt(common_arg(
+        {"--pool-workers"}, "N",
+        "number of CPU workers for the host-resident expert path; the pool is llama.cpp's CPU backend\n"
+        "thread pool, so this is -t/-tb under the engine's name (default: -1, the build default)",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.cpuparams.n_threads       = value;
+            params.cpuparams_batch.n_threads = value;
+        }
+    ).set_env("LLAMA_ARG_POOL_WORKERS"));
+    add_opt(common_arg(
+        {"--vram-arena"}, "auto|N",
+        "size the MoE expert cache from the card instead of a hand-picked MiB value:\n"
+        "auto = free VRAM at load minus --vram-arena-margin-mib, N = exactly N MiB\n"
+        "(implies --moe-cache-mib; default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_cache_size = 0;
+                params.moe_cache_auto = true;
+                return;
+            }
+            int mib = 0;
+            try {
+                mib = std::stoi(value);
+            } catch (...) {
+                throw std::invalid_argument("expected 'auto' or a MiB value");
+            }
+            if (mib < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_cache_size = (size_t) mib*1024*1024;
+            params.moe_cache_auto = false;
+        }
+    ).set_env("LLAMA_ARG_VRAM_ARENA"));
+    add_opt(common_arg(
+        {"--vram-arena-margin-mib"}, "N",
+        "free VRAM kept out of --vram-arena auto for compute buffers and driver headroom; the KV cache is estimated from n_ctx and the -ctk/-ctv types and added on top (default: 768)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vram_arena_margin_mib = value;
+        }
+    ).set_env("LLAMA_ARG_VRAM_ARENA_MARGIN_MIB"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

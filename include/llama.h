@@ -397,6 +397,8 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        const char * moe_cache_profile; // path to STRP profile for MoE cache eviction bias, nullptr = none [EXPERIMENTAL]
+        const char * moe_cache_profile_save; // path to save a STRP profile, nullptr = none [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

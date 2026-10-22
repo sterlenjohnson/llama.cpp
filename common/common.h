@@ -596,6 +596,10 @@ struct common_params {
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
+    std::string moe_cache_profile; // path to a STRP profile used to bias MoE cache eviction toward hot experts (bounded step)
+    std::string moe_cache_profile_save; // path to save a STRP profile captured from this run [EXPERIMENTAL]
+    bool   moe_cache_auto = false; // size the MoE expert cache from the card's free VRAM at load (--vram-arena auto)
+    int32_t vram_arena_margin_mib = 768; // free VRAM kept out of the auto arena for compute buffers and driver headroom (the KV term is added from n_ctx)
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
