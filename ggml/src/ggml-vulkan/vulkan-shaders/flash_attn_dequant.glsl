@@ -30,6 +30,10 @@ layout (binding = 2) readonly buffer V_PACKED_Q8_0 { block_q8_0_packed16 data[];
 layout (binding = 1) readonly buffer K_PACKED_IQ4_NL { block_iq4_nl_packed16 data[]; } k_packed_iq4_nl;
 layout (binding = 2) readonly buffer V_PACKED_IQ4_NL { block_iq4_nl_packed16 data[]; } v_packed_iq4_nl;
 
+// 32-bit word views of K/V, for the FA_WIDE loads (blocks are only 2-byte aligned, so words are realigned).
+layout (binding = 1) readonly buffer K_U32 { uint data[]; } k_u32;
+layout (binding = 2) readonly buffer V_U32 { uint data[]; } v_u32;
+
 layout (binding = 1) readonly buffer K_PACKED_BF16 { u16vec4 data[]; } k_packed_bf16;
 layout (binding = 2) readonly buffer V_PACKED_BF16 { u16vec4 data[]; } v_packed_bf16;
 

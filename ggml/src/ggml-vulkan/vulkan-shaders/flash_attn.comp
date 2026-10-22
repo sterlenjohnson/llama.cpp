@@ -33,6 +33,11 @@ const uint32_t cols_per_iter = WorkGroupSize / D_split / row_split;
 const uint32_t cols_per_thread = Bc / cols_per_iter;
 const uint32_t num_subgroups = SubGroupSize == 0 ? 0 : WorkGroupSize / SubGroupSize;
 
+#define WIDE_K (FA_WIDE && SHMEM_STAGING == 0 && (FaTypeK == GGML_TYPE_Q8_0 || FaTypeK == GGML_TYPE_Q4_0) && (HSK % 64) == 0)
+#define WIDE_V (FA_WIDE && SHMEM_STAGING == 0 && (FaTypeV == GGML_TYPE_Q8_0 || FaTypeV == GGML_TYPE_Q4_0) && (HSV % 64) == 0)
+// vec4 index of a thread's d-th V/O element: interleaved by default, contiguous per thread for WIDE_V
+#define VIDX(d) (WIDE_V ? (d_tid * (HSV_per_thread / 4) + (d)) : ((d) * D_split + d_tid))
+
 
 layout (binding = 0) readonly buffer Q {float data_q[];};
 layout (binding = 0) readonly buffer QV4 {vec4 data_qv4[];};
@@ -403,7 +408,36 @@ void main() {
 
                     k_dm = ACC_TYPEV2(get_k_scale(ib, k_offset));
 
-                    if (block8_fast) {
+                    if (WIDE_K) {
+                        // byte offset of the first quant word this step needs; always even
+                        const uint kb = (k_offset + ib) * FaBlockBytesK + 2u +
+                                        (FaTypeK == GGML_TYPE_Q8_0 ? iqs : (iqs & 0xFu));
+                        const uint kw0 = kb >> 2;
+                        const bool kmis = (kb & 2u) != 0;
+                        const uint nkw = (FaTypeK == GGML_TYPE_Q4_0 && block8_fast) ? 4u : d_per_step;
+                        uint kw[d_per_step + 1];
+                        [[unroll]] for (uint32_t w = 0; w <= nkw; w++) {
+                            kw[w] = k_u32.data[kw0 + w];
+                        }
+                        [[unroll]] for (uint32_t w = 0; w < nkw; w++) {
+                            kw[w] = kmis ? ((kw[w] >> 16) | (kw[w + 1] << 16)) : kw[w];
+                        }
+                        if (FaTypeK == GGML_TYPE_Q8_0) {
+                            [[unroll]] for (uint32_t d = 0; d < d_per_step; d++) {
+                                k_quants[d] = int32_t(kw[d]);
+                            }
+                        } else if (block8_fast) {
+                            [[unroll]] for (uint32_t d = 0; d < 4; d++) {
+                                k_quants[d    ] = int32_t( kw[d]       & 0x0F0F0F0Fu);
+                                k_quants[d + 4] = int32_t((kw[d] >> 4) & 0x0F0F0F0Fu);
+                            }
+                        } else {
+                            const uint kshift = (iqs & 0x10u) >> 2;
+                            [[unroll]] for (uint32_t d = 0; d < d_per_step; d++) {
+                                k_quants[d] = int32_t((kw[d] >> kshift) & 0x0F0F0F0Fu);
+                            }
+                        }
+                    } else if (block8_fast) {
                         fa_k_qs_block8 blk = get_k_qs_block8(ib, k_offset);
                         [[unroll]] for (uint32_t d = 0; d < 8; d++) {
                             k_quants[d] = blk.qs[d];
@@ -524,9 +558,64 @@ void main() {
                 Lf[r] += Pf[r];
             }
 
+            FLOAT_TYPEV4 Vw[HSV_per_thread / 4];
+            if (WIDE_V) {
+                // this thread's HSV_per_thread contiguous elements of row vcol
+                const uint E = HSV_per_thread;
+                const uint e0 = d_tid * E;
+                const uint nblk = E >= 32 ? E / 32 : 1;
+                [[unroll]] for (uint32_t bi = 0; bi < nblk; ++bi) {
+                    const uint ib = vcol * v_stride + e0 / 32 + bi;
+                    const uint within = E >= 32 ? 0u : (e0 % 32);
+                    const uint ev = E >= 32 ? 32u : E;           // elements taken from this block
+                    FLOAT_TYPE vd;
+                    uint vb;
+                    if (FaTypeV == GGML_TYPE_Q8_0) {
+                        vd = FLOAT_TYPE(v_packed_q8_0.data[v_offset + ib].d);
+                        vb = (v_offset + ib) * FaBlockBytesV + 2u + within;
+                    } else {
+                        vd = FLOAT_TYPE(v_packed_q4_0.data[v_offset + ib].d);
+                        vb = (v_offset + ib) * FaBlockBytesV + 2u + (within & 0xFu);
+                    }
+                    // q8_0: one word per 4 elements; q4_0: a full block is 4 words (low then high nibbles),
+                    // a partial one is one word per 4 elements with a nibble shift
+                    const uint nvw = (FaTypeV == GGML_TYPE_Q4_0 && ev == 32) ? 4u : ev / 4;
+                    const uint vw0 = vb >> 2;
+                    const bool vmis = (vb & 2u) != 0;
+                    uint vw[9];
+                    [[unroll]] for (uint32_t w = 0; w <= nvw; w++) {
+                        vw[w] = v_u32.data[vw0 + w];
+                    }
+                    [[unroll]] for (uint32_t w = 0; w < nvw; w++) {
+                        vw[w] = vmis ? ((vw[w] >> 16) | (vw[w + 1] << 16)) : vw[w];
+                    }
+                    if (FaTypeV == GGML_TYPE_Q8_0) {
+                        [[unroll]] for (uint32_t w = 0; w < nvw; w++) {
+                            const i8vec4 q = unpack8(int32_t(vw[w]));
+                            Vw[bi * 8 + w] = vd * FLOAT_TYPEV4(q.x, q.y, q.z, q.w);
+                        }
+                    } else if (ev == 32) {
+                        [[unroll]] for (uint32_t w = 0; w < 4; w++) {
+                            const u8vec4 lo = unpack8(vw[w] & 0x0F0F0F0Fu);
+                            const u8vec4 hi = unpack8((vw[w] >> 4) & 0x0F0F0F0Fu);
+                            Vw[bi * 8 + w]     = vd * (FLOAT_TYPEV4(lo.x, lo.y, lo.z, lo.w) - FLOAT_TYPE(8.0f));
+                            Vw[bi * 8 + 4 + w] = vd * (FLOAT_TYPEV4(hi.x, hi.y, hi.z, hi.w) - FLOAT_TYPE(8.0f));
+                        }
+                    } else {
+                        const uint vshift = (within & 0x10u) >> 2;
+                        [[unroll]] for (uint32_t w = 0; w < nvw; w++) {
+                            const u8vec4 q = unpack8((vw[w] >> vshift) & 0x0F0F0F0Fu);
+                            Vw[w] = vd * (FLOAT_TYPEV4(q.x, q.y, q.z, q.w) - FLOAT_TYPE(8.0f));
+                        }
+                    }
+                }
+            }
+
             [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
                 FLOAT_TYPEV4 Vf;
-                if (SHMEM_STAGING != 0) {
+                if (WIDE_V) {
+                    Vf = Vw[d];
+                } else if (SHMEM_STAGING != 0) {
                     Vf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
                 } else if (USE_DECODE_V) {
                     uint coord = vcol * v_stride * BLOCK_SIZE_V + 4 * (d * D_split + d_tid);
@@ -672,7 +761,7 @@ void main() {
                 const uint row = tile_row(r);
                 if (row < N) {
                     [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
-                        gqaStore(row, d * D_split + d_tid, Of[r][d], o_offset, iq2, N);
+                        gqaStore(row, VIDX(d), Of[r][d], o_offset, iq2, N);
                     }
                 }
             }
@@ -694,7 +783,7 @@ void main() {
                     uint32_t o_offset = HSV * p.ne1 * (split_k_index + p.k_num * (global_row + p.ne2 * iq3)) / 4;
 
                     [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
-                        data_ov4[o_offset + iq2 * HSV/4 + d * D_split + d_tid] = D_TYPEV4(Of[r][d]);
+                        data_ov4[o_offset + iq2 * HSV/4 + VIDX(d)] = D_TYPEV4(Of[r][d]);
                     }
                 }
 
@@ -750,7 +839,7 @@ void main() {
             const uint row = tile_row(r);
             if (row < N) {
                 [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
-                    gqaStore(row, d * D_split + d_tid, Of[r][d], o_offset, iq2, N);
+                    gqaStore(row, VIDX(d), Of[r][d], o_offset, iq2, N);
                 }
             }
         }
@@ -759,7 +848,7 @@ void main() {
             const uint row = tile_row(r);
             if (i * Br + row < N) {
                 [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
-                    data_ov4[o_offset + (iq2 * HSV + (i * Br + row) * p.ne1 * HSV) / 4 + d * D_split + d_tid] = D_TYPEV4(Of[r][d]);
+                    data_ov4[o_offset + (iq2 * HSV + (i * Br + row) * p.ne1 * HSV) / 4 + VIDX(d)] = D_TYPEV4(Of[r][d]);
                 }
             }
         }

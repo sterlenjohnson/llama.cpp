@@ -1218,6 +1218,17 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         row_split_max_hsk = n_rows <= 8 ? 64 : 128;
     }
     result.row_split = (n_rows < 4 || hsk <= row_split_max_hsk) ? 1 : 4;
+    const bool rdna1 = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == vk_device_architecture::AMD_RDNA1 && !device->uma;
+    // D_split 4 below is only used where upstream already picks row_split 1 (verified combination)
+    const bool upstream_row_split_1 = result.row_split == 1;
+    // RDNA1 GQA-4 decode (4 rows; 8 rows breaks Br >= gqa_ratio for odd head sizes): row_split 4 makes every row group reload and re-dequantize the same K/V.
+    // One row group holding all rows reads each K/V element once (Ornith-shaped hs256 GQA-4, kv 128k: q4_0 1570 -> 1095 us).
+    if (rdna1 && !device->disable_fa_rs1 && n_rows == 4) {
+        result.row_split = 1;
+    }
+    if (device->fa_row_split && n_rows >= 4) {
+        result.row_split = device->fa_row_split;
+    }
 
     if (result.subgroup_size > 32 && (n_rows < 4 || hsk < (result.row_split == 1 ? 128 : 64))) {
         result.workgroup_size = result.subgroup_size * 2;
@@ -1246,8 +1257,21 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
 
     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
+    // RDNA1 quantized-K decode, hsk <= 128: 4 lanes per row instead of 8, so each lane covers 16-32 contiguous
+    // quants (fewer scale loads per byte). hs64 GQA-4 q8_0 kv 128k: 999 -> 827 us; hs128 MHA q4_0 kv 32k: 438 -> 348 us.
+    if (rdna1 && !device->disable_fa_ds4 && upstream_row_split_1 && n_rows <= 8 && hsk <= 128 && hsv <= 128 &&
+        ggml_is_quantized(k_type)) {
+        result.d_split = std::min(4u, D_lsb / 4);
+    }
+    if (device->fa_d_split) {
+        result.d_split = std::min(device->fa_d_split, D_lsb / 4);
+    }
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
+    // upstream PR 28507 enables staging on all AMD RDNA; GGML_VK_FA_SHMEM_STAGING=0/1 forces it for A/B.
+    if (device->fa_shmem_staging >= 0) {
+        result.shmem_staging = (uint32_t)device->fa_shmem_staging;
+    }
 
     if (!reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
         result.block_rows /= 2;
@@ -1385,6 +1409,11 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
                      (use_logit_softcap ? 4 : 0) |
                      (old_amd_windows   ? 8 : 0) |
                      (use_sparse        ? 16 : 0);
+    // RDNA1: 32-bit word loads for q8_0/q4_0 K/V in the scalar path (the shader checks type, head size and staging)
+    if (params.path == FA_SCALAR && !device->disable_fa_wide && device->vendor_id == VK_VENDOR_ID_AMD &&
+        device->architecture == vk_device_architecture::AMD_RDNA1) {
+        flags |= 32;
+    }
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -4089,6 +4118,21 @@ vk_device ggml_vk_get_device(size_t idx) {
             device->fa_split_k_mult = std::max(1, atoi(e));
         }
         device->disable_fa_qsplit = getenv("GGML_VK_DISABLE_FA_QSPLIT") != nullptr;
+        device->disable_fa_wide = getenv("GGML_VK_DISABLE_FA_WIDE") != nullptr;
+        device->fa_row_split = 0;
+        if (const char * e = getenv("GGML_VK_FA_ROW_SPLIT")) {
+            device->fa_row_split = (uint32_t)std::max(1, atoi(e));
+        }
+        device->disable_fa_rs1 = getenv("GGML_VK_DISABLE_FA_RS1") != nullptr;
+        device->disable_fa_ds4 = getenv("GGML_VK_DISABLE_FA_DS4") != nullptr;
+        device->fa_d_split = 0;
+        if (const char * e = getenv("GGML_VK_FA_D_SPLIT")) {
+            device->fa_d_split = (uint32_t)std::max(1, atoi(e));
+        }
+        device->fa_shmem_staging = -1;
+        if (const char * e = getenv("GGML_VK_FA_SHMEM_STAGING")) {
+            device->fa_shmem_staging = atoi(e) ? 1 : 0;
+        }
 
         const char* GGML_VK_ALLOW_SYSMEM_FALLBACK = getenv("GGML_VK_ALLOW_SYSMEM_FALLBACK");
         device->allow_sysmem_fallback = GGML_VK_ALLOW_SYSMEM_FALLBACK != nullptr;

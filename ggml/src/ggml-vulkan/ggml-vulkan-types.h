@@ -1041,6 +1041,12 @@ struct vk_device_struct {
     bool disable_iq2_s_mmq;
     uint32_t fa_split_k_mult; // tuning aid: forces the FA split_k occupancy multiplier (0 = auto)
     bool disable_fa_qsplit;   // GGML_VK_DISABLE_FA_QSPLIT: no extra FA split_k for quantized KV on RDNA1
+    bool disable_fa_wide;     // GGML_VK_DISABLE_FA_WIDE: no 32-bit-word q8_0/q4_0 K/V loads in scalar FA (RDNA1)
+    uint32_t fa_row_split;    // GGML_VK_FA_ROW_SPLIT (tuning aid): force scalar FA row_split (0 = auto)
+    bool disable_fa_rs1;      // GGML_VK_DISABLE_FA_RS1: keep upstream row_split for 4..8-row (GQA) decode on RDNA1
+    bool disable_fa_ds4;      // GGML_VK_DISABLE_FA_DS4: keep D_split 8 for quantized-K decode on RDNA1
+    uint32_t fa_d_split;      // GGML_VK_FA_D_SPLIT (tuning aid): force scalar FA D_split (0 = auto)
+    int  fa_shmem_staging;    // GGML_VK_FA_SHMEM_STAGING=0/1 forces scalar FA K/V shmem staging (-1 = default rule)
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 

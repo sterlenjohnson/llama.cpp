@@ -26,6 +26,9 @@ const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
 // Sparse: gather binding-7 indices instead of scanning [0,KV); p.split_kv = n_kv_max.
 const bool USE_SPARSE      = (Flags & 16) != 0;
+// RDNA1 wide quantized K/V loads (GGML_VK_DISABLE_FA_WIDE reverts): 32-bit word loads of q8_0/q4_0
+// quants with a 16-bit realign, and a contiguous per-thread V slice. Scalar path without staging only.
+const bool FA_WIDE         = (Flags & 32) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;

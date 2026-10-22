@@ -12051,6 +12051,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
+    // long-context decode (RDNA1 FA paths): hs256 GQA-4/8, hs128 GQA-4/MHA, hs64 GQA-4, kv 32768, q8_0 / q4_0 / mixed.
+    // (f16 K/V is left out: at kv 32768 upstream's f16 path already reads ERR ~7e-4 against the 5e-4 limit.)
+    for (auto tkv : std::vector<std::array<ggml_type,2>>{{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
+                                                          {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
+        for (int nb : {1, 2}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, tkv[0], tkv[1]));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, tkv[0], tkv[1]));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, tkv[0], tkv[1]));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 16, {1, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, tkv[0], tkv[1]));
+            test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {4, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, tkv[0], tkv[1]));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -12411,6 +12423,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t kv : {2048, 8192, 16384}) {
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 16, {1, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+        }
+    }
+
+    // RDNA1 long-context decode attention: Ornith/Qwen3.5 (hs256, 16q/4kv), LFM2.5 (hs64, 32q/8kv), OLMoE (hs128, 16/16)
+    for (auto tkv : std::vector<std::array<ggml_type,2>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
+                                                          {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
+        for (int64_t kv : {32768, 65536, 131072}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, tkv[0], tkv[1]));
+            test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {4, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, tkv[0], tkv[1]));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, tkv[0], tkv[1]));
+            if (kv <= 32768) {
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 16, {1, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, tkv[0], tkv[1]));
+            }
         }
     }
 
