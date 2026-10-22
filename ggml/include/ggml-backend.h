@@ -450,6 +450,28 @@ extern "C" {
     // Compare the output of two backends
     GGML_API bool ggml_backend_compare_graph_backend(ggml_backend_t backend1, ggml_backend_t backend2, struct ggml_cgraph * graph, ggml_backend_eval_callback callback, void * user_data, struct ggml_tensor const * const * test_nodes, size_t num_test_nodes);
 
+    // PCIe traffic accounting (GGML_PCIE_STATS=1 or LLAMA_PCIE_STATS=1)
+    // every tensor set/get whose tensor lives in a non-host buffer, and every scheduler copy between a host and a
+    // non-host buffer, is counted under the tag of the calling thread
+    enum ggml_backend_pcie_tag {
+        GGML_PCIE_OTHER = 0,     // untagged transfers
+        GGML_PCIE_INPUT,         // graph inputs (tokens, positions, masks), scheduler copies
+        GGML_PCIE_ACT,           // activations copied between splits (scheduler)
+        GGML_PCIE_WEIGHT,        // host weights copied by the scheduler without a callback
+        GGML_PCIE_EXPERT_LARGE,  // experts uploaded for large batches (copy callback)
+        GGML_PCIE_EXPERT_CACHE,  // experts uploaded into the MoE cache
+        GGML_PCIE_IDS,           // selected expert ids read back by the MoE cache
+        GGML_PCIE_SLOT_MAP,      // MoE cache slot maps
+        GGML_PCIE_OUTPUT,        // logits / embeddings read back by the context
+        GGML_PCIE_N_TAGS,
+    };
+    GGML_API bool         ggml_backend_pcie_stats_enabled(void);
+    GGML_API int          ggml_backend_pcie_set_tag(int tag); // returns the previous tag of the calling thread
+    GGML_API void         ggml_backend_pcie_add(int tag, bool h2d, size_t bytes);
+    // bytes[tag*2 + 0] = host to device, bytes[tag*2 + 1] = device to host, same for counts
+    GGML_API void         ggml_backend_pcie_get(uint64_t * bytes, uint64_t * counts);
+    GGML_API const char * ggml_backend_pcie_tag_name(int tag);
+
     // Tensor initialization
     GGML_API enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, void * addr);
     GGML_API enum ggml_status ggml_backend_view_init(struct ggml_tensor * tensor);

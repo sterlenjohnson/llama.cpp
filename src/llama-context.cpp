@@ -587,6 +587,9 @@ llama_context::llama_context(
 
 llama_context::~llama_context() {
     ggml_hp_report();
+    if (ggml_backend_pcie_stats_enabled()) {
+        pcie_print();
+    }
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -608,6 +611,35 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+}
+
+void llama_context::pcie_print() const {
+    auto print = [](const char * name, const pcie_phase & ph) {
+        if (ph.n_tokens == 0) {
+            return;
+        }
+        uint64_t tot_h2d = 0;
+        uint64_t tot_d2h = 0;
+        for (int t = 0; t < GGML_PCIE_N_TAGS; ++t) {
+            tot_h2d += ph.bytes[t*2 + 0];
+            tot_d2h += ph.bytes[t*2 + 1];
+        }
+        fprintf(stderr, "llama_pcie: %s: %" PRIu64 " tokens in %" PRIu64 " calls, per token: h2d %.3f MiB, d2h %.3f MiB, total %.3f MiB\n",
+            name, ph.n_tokens, ph.n_calls, tot_h2d/1048576.0/ph.n_tokens, tot_d2h/1048576.0/ph.n_tokens, (tot_h2d + tot_d2h)/1048576.0/ph.n_tokens);
+        for (int t = 0; t < GGML_PCIE_N_TAGS; ++t) {
+            for (int d = 0; d < 2; ++d) {
+                const uint64_t b = ph.bytes[t*2 + d];
+                const uint64_t c = ph.counts[t*2 + d];
+                if (c == 0) {
+                    continue;
+                }
+                fprintf(stderr, "llama_pcie: %s:   %-24s %s %12.1f KiB/token %9.2f transfers/token\n",
+                    name, ggml_backend_pcie_tag_name(t), d == 0 ? "h2d" : "d2h", b/1024.0/ph.n_tokens, (double) c/ph.n_tokens);
+            }
+        }
+    };
+    print("prompt    ", pcie_pp);
+    print("generation", pcie_tg);
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -1585,7 +1617,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         GGML_HP(GGML_HP_SET_INPUTS);
+        const int pcie_prev = ggml_backend_pcie_set_tag(GGML_PCIE_INPUT);
         res->set_inputs(&ubatch);
+        ggml_backend_pcie_set_tag(pcie_prev);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -1691,6 +1725,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn() : nullptr;
 
     // extract logits
+    const int pcie_out_prev = ggml_backend_pcie_set_tag(GGML_PCIE_OUTPUT);
     if (logits.data && t_logits) {
         ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
         GGML_ASSERT(backend_res != nullptr);
@@ -1763,6 +1798,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
     }
+    ggml_backend_pcie_set_tag(pcie_out_prev);
 
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
@@ -1914,6 +1950,57 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+
+    // PCIe traffic of this call, attributed when it returns
+    struct pcie_guard {
+        llama_context * ctx;
+        uint32_t n_tokens;
+        uint64_t bytes [GGML_PCIE_N_TAGS*2];
+        uint64_t counts[GGML_PCIE_N_TAGS*2];
+        pcie_guard(llama_context * ctx, uint32_t n_tokens) : ctx(ctx), n_tokens(n_tokens) {
+            if (ggml_backend_pcie_stats_enabled()) {
+                ggml_backend_pcie_get(bytes, counts);
+            }
+        }
+        ~pcie_guard() {
+            if (!ggml_backend_pcie_stats_enabled()) {
+                return;
+            }
+            uint64_t b[GGML_PCIE_N_TAGS*2];
+            uint64_t c[GGML_PCIE_N_TAGS*2];
+            ggml_backend_pcie_get(b, c);
+            auto & ph = n_tokens > 1 ? ctx->pcie_pp : ctx->pcie_tg;
+            uint64_t tot_h2d = 0;
+            uint64_t tot_d2h = 0;
+            for (int i = 0; i < GGML_PCIE_N_TAGS*2; ++i) {
+                ph.bytes[i]  += b[i] - bytes[i];
+                ph.counts[i] += c[i] - counts[i];
+                tot_h2d += (i % 2 == 0) ? (b[i] - bytes[i]) : 0;
+                tot_d2h += (i % 2 == 1) ? (b[i] - bytes[i]) : 0;
+            }
+            ph.n_tokens += n_tokens;
+            ph.n_calls++;
+            // one line per call: the tools that never free the context still show the traffic
+            // (a direct write: the tools filter LLAMA_LOG_INFO at the default verbosity)
+            if (ph.n_calls <= 8 || n_tokens > 1) {
+                fprintf(stderr, "llama_pcie: %s call %llu: %u tokens, h2d %.3f MiB, d2h %.3f MiB\n",
+                    n_tokens > 1 ? "prompt" : "decode", (unsigned long long) ph.n_calls, n_tokens,
+                    tot_h2d/1048576.0, tot_d2h/1048576.0);
+                for (int t = 0; t < GGML_PCIE_N_TAGS; ++t) {
+                    for (int d = 0; d < 2; ++d) {
+                        const uint64_t bb = ph.bytes[t*2 + d];
+                        const uint64_t cc = ph.counts[t*2 + d];
+                        if (cc == 0) {
+                            continue;
+                        }
+                        fprintf(stderr, "llama_pcie:   %-24s %s %12.1f KiB/call %9.2f transfers/call\n",
+                            ggml_backend_pcie_tag_name(t), d == 0 ? "h2d" : "d2h",
+                            (double) bb/1024.0, (double) cc);
+                    }
+                }
+            }
+        }
+    } pcie_g(this, n_tokens_all);
 
     if (output_all) {
         // require that all tokens are output
@@ -2827,10 +2914,15 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
 
+    // the experts a large batch needs are uploaded whole: that is the prefill's PCIe traffic
+    const int pcie_prev = ggml_backend_pcie_set_tag(GGML_PCIE_EXPERT_LARGE);
+
     if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
+        ggml_backend_pcie_set_tag(GGML_PCIE_IDS);
         ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
         ggml_backend_synchronize(backend);
+        ggml_backend_pcie_set_tag(GGML_PCIE_EXPERT_LARGE);
 
         st.used.assign(n_expert, false);
         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
@@ -2880,6 +2972,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
         first = last + 1;
     }
+
+    ggml_backend_pcie_set_tag(pcie_prev);
 
     return true;
 }

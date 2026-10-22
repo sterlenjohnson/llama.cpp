@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
 #include <unordered_map>
 #include <vector>
 
@@ -399,6 +401,69 @@ size_t ggml_backend_get_alignment(ggml_backend_t backend) {
     return ggml_backend_buft_get_alignment(ggml_backend_get_default_buffer_type(backend));
 }
 
+// PCIe accounting
+//
+// Every transfer between host memory and a device buffer is counted under the tag of the calling
+// thread, so a run can be split into "the experts went up" and "the activations went up".  The
+// question this answers on the 5600M: the 35B's prefill moves 14.2 GiB of experts over a 6.9 GB/s
+// link and it only achieves 3.2 GB/s - this says which copy is the slow one.
+
+static bool ggml_backend_pcie_init_enabled() {
+    const char * a = getenv("GGML_PCIE_STATS");
+    const char * b = getenv("LLAMA_PCIE_STATS");
+    return (a && atoi(a) != 0) || (b && atoi(b) != 0);
+}
+
+static const bool g_pcie_enabled = ggml_backend_pcie_init_enabled();
+static std::atomic<uint64_t> g_pcie_bytes [GGML_PCIE_N_TAGS*2];
+static std::atomic<uint64_t> g_pcie_counts[GGML_PCIE_N_TAGS*2];
+static thread_local int g_pcie_tag = GGML_PCIE_OTHER;
+
+bool ggml_backend_pcie_stats_enabled(void) {
+    return g_pcie_enabled;
+}
+
+int ggml_backend_pcie_set_tag(int tag) {
+    const int prev = g_pcie_tag;
+    g_pcie_tag = tag;
+    return prev;
+}
+
+void ggml_backend_pcie_add(int tag, bool h2d, size_t bytes) {
+    if (!g_pcie_enabled || bytes == 0) {
+        return;
+    }
+    GGML_ASSERT(tag >= 0 && tag < GGML_PCIE_N_TAGS);
+    g_pcie_bytes [tag*2 + (h2d ? 0 : 1)].fetch_add(bytes, std::memory_order_relaxed);
+    g_pcie_counts[tag*2 + (h2d ? 0 : 1)].fetch_add(1,     std::memory_order_relaxed);
+}
+
+void ggml_backend_pcie_get(uint64_t * bytes, uint64_t * counts) {
+    for (int i = 0; i < GGML_PCIE_N_TAGS*2; i++) {
+        if (bytes)  { bytes[i]  = g_pcie_bytes[i].load(std::memory_order_relaxed); }
+        if (counts) { counts[i] = g_pcie_counts[i].load(std::memory_order_relaxed); }
+    }
+}
+
+const char * ggml_backend_pcie_tag_name(int tag) {
+    static const char * names[GGML_PCIE_N_TAGS] = {
+        "other", "graph inputs", "activations", "host weights", "experts (large batch)", "experts (MoE cache)",
+        "expert ids readback", "slot maps", "logits/embd readback",
+    };
+    return tag >= 0 && tag < GGML_PCIE_N_TAGS ? names[tag] : "?";
+}
+
+// a transfer to or from a tensor crosses PCIe if the tensor is not in host memory
+static inline void ggml_backend_pcie_count_tensor(const struct ggml_tensor * tensor, bool h2d, size_t size) {
+    if (!g_pcie_enabled) {
+        return;
+    }
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    if (buf != NULL && !ggml_backend_buffer_is_host(buf)) {
+        ggml_backend_pcie_add(g_pcie_tag, h2d, size);
+    }
+}
+
 size_t ggml_backend_get_max_size(ggml_backend_t backend) {
     return ggml_backend_buft_get_max_size(ggml_backend_get_default_buffer_type(backend));
 }
@@ -414,6 +479,7 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_set(tensor, data, offset, size);
     } else {
+        ggml_backend_pcie_count_tensor(tensor, true, size);
         backend->iface.set_tensor_async(backend, tensor, data, offset, size);
     }
 }
@@ -429,6 +495,7 @@ void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_ten
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_get(tensor, data, offset, size);
     } else {
+        ggml_backend_pcie_count_tensor(tensor, false, size);
         backend->iface.get_tensor_async(backend, tensor, data, offset, size);
     }
 }
@@ -451,6 +518,7 @@ void ggml_backend_tensor_set_2d_async(ggml_backend_t backend, struct ggml_tensor
 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+    ggml_backend_pcie_count_tensor(tensor, true, size*n_copies);
     backend->iface.set_tensor_2d_async(backend, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
@@ -472,6 +540,7 @@ void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_
 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
+    ggml_backend_pcie_count_tensor(tensor, false, size*n_copies);
     backend->iface.get_tensor_2d_async(backend, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
@@ -487,6 +556,7 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
+    ggml_backend_pcie_count_tensor(tensor, true, size);
     buf->iface.set_tensor(buf, tensor, data, offset, size);
 }
 
@@ -502,6 +572,7 @@ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, siz
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
 
+    ggml_backend_pcie_count_tensor(tensor, false, size);
     buf->iface.get_tensor(buf, tensor, data, offset, size);
 }
 
@@ -524,6 +595,7 @@ void ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
+    ggml_backend_pcie_count_tensor(tensor, true, size*n_copies);
     buf->iface.set_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
@@ -546,6 +618,7 @@ void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor, void * data, 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
 
+    ggml_backend_pcie_count_tensor(tensor, false, size*n_copies);
     buf->iface.get_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
@@ -1823,7 +1896,22 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
+static void ggml_backend_sched_copy_input_impl(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input);
+
+// the copies of the scheduler are counted by kind: graph inputs, host weights, activations
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+    int tag = GGML_PCIE_ACT;
+    if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+        tag = GGML_PCIE_INPUT;
+    } else if (ggml_backend_sched_is_host_weight(input)) {
+        tag = GGML_PCIE_WEIGHT;
+    }
+    const int prev = ggml_backend_pcie_set_tag(tag);
+    ggml_backend_sched_copy_input_impl(sched, split, input);
+    ggml_backend_pcie_set_tag(prev);
+}
+
+static void ggml_backend_sched_copy_input_impl(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
     GGML_HP(GGML_HP_SCHED_COPY_INPUT);
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -1868,7 +1956,17 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
 
     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+    if (split_backend->iface.cpy_tensor_async && split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+        if (ggml_backend_pcie_stats_enabled()) {
+            ggml_backend_buffer_t bs = input->view_src ? input->view_src->buffer : input->buffer;
+            ggml_backend_buffer_t bd = input_cpy->view_src ? input_cpy->view_src->buffer : input_cpy->buffer;
+            const bool hs = bs == NULL || ggml_backend_buffer_is_host(bs);
+            const bool hd = bd == NULL || ggml_backend_buffer_is_host(bd);
+            if (hs != hd) {
+                ggml_backend_pcie_add(g_pcie_tag, hs, ggml_nbytes(input));
+            }
+        }
+    } else {
         ggml_backend_synchronize(input_backend);
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);

@@ -928,6 +928,7 @@ struct llama_moe_cache::impl {
             ids.resize(n_ids);
             ids_data = ids.data();
         }
+        const int pcie_prev = ggml_backend_pcie_set_tag(GGML_PCIE_IDS);
         {
             GGML_HP(GGML_HP_MOE_IDS);
             ggml_backend_tensor_get_async(backend, sel, ids_data, 0, ggml_nbytes(sel));
@@ -966,6 +967,7 @@ struct llama_moe_cache::impl {
                     n++;
                 }
                 ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                ggml_backend_pcie_set_tag(GGML_PCIE_EXPERT_CACHE);
                 bytes += n*expert_size;
                 i += n;
             }
@@ -978,7 +980,9 @@ struct llama_moe_cache::impl {
 
         // the next copy synchronizes the backend before it changes the slot map again
         // the backend reads a pinned slot map when the copy executes (Vulkan stages and synchronizes a pageable one here)
+        ggml_backend_pcie_set_tag(GGML_PCIE_SLOT_MAP);
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+        ggml_backend_pcie_set_tag(pcie_prev);
 
         return true;
     }

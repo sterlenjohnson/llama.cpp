@@ -387,6 +387,17 @@ private:
 
     copy_experts_info copy_experts;
 
+    // PCIe traffic per decode call (LLAMA_PCIE_STATS=1), split into prompt (more than one token) and generation calls
+    struct pcie_phase {
+        uint64_t bytes [GGML_PCIE_N_TAGS*2] = {};
+        uint64_t counts[GGML_PCIE_N_TAGS*2] = {};
+        uint64_t n_tokens = 0;
+        uint64_t n_calls  = 0;
+    };
+    pcie_phase pcie_pp;
+    pcie_phase pcie_tg;
+    void pcie_print() const;
+
     // graph reallocations during inference where the backend assignments did not change, split by whether the
     // graph size is the same as the previously scheduled one (unexpected) or different
     int32_t n_reallocs_same = 0;
