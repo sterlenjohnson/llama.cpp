@@ -356,16 +356,41 @@ static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
 }
 
 static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
-    size_t pos = endpoint.find(':');
-    if (pos == std::string::npos) {
+    // accepts "host:port" and, for IPv6 literals, "[addr]:port"; a bare IPv6
+    // literal cannot be used because the port separator would be ambiguous
+    std::string host_str;
+    std::string port_str;
+    if (!endpoint.empty() && endpoint[0] == '[') {
+        size_t close = endpoint.find(']');
+        if (close == std::string::npos || close + 1 >= endpoint.size() || endpoint[close + 1] != ':') {
+            return false;
+        }
+        host_str = endpoint.substr(1, close - 1);
+        port_str = endpoint.substr(close + 2);
+    } else {
+        size_t pos = endpoint.find(':');
+        if (pos == std::string::npos) {
+            return false;
+        }
+        host_str = endpoint.substr(0, pos);
+        port_str = endpoint.substr(pos + 1);
+    }
+    if (host_str.empty() || port_str.empty()) {
         return false;
     }
-    host = endpoint.substr(0, pos);
     try {
-        port = std::stoi(endpoint.substr(pos + 1));
+        size_t consumed = 0;
+        port = std::stoi(port_str, &consumed);
+        if (consumed != port_str.size()) {
+            return false;
+        }
     } catch (...) {
         return false;
     }
+    if (port <= 0 || port > 65535) {
+        return false;
+    }
+    host = host_str;
     return true;
 }
 
@@ -2234,7 +2259,8 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
     uint8_t local_caps[RPC_CONN_CAPS_SIZE] = {};
     uint8_t remote_caps[RPC_CONN_CAPS_SIZE] = {};
     if (request.rank == 0) {
-        socket_ptr srv = socket_t::create_server("0.0.0.0", request.port);
+        // dual-stack wildcard: a single socket accepts both families
+        socket_ptr srv = socket_t::create_server(nullptr, request.port);
         if (srv == nullptr) {
             LOG_ERROR("[%s] failed to listen on comm port %u\n", __func__, request.port);
             return true;

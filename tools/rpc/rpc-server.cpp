@@ -105,7 +105,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -h, --help                       show this help message and exit\n");
     fprintf(stderr, "  -t, --threads N                  number of threads for the CPU device (default: %d)\n", params.n_threads);
     fprintf(stderr, "  -d, --device <dev1,dev2,...>     comma-separated list of devices\n");
-    fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
+    fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s; use :: for dual-stack IPv4+IPv6)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
     fprintf(stderr, "\n");
@@ -236,7 +236,15 @@ int main(int argc, char * argv[]) {
         fprintf(stderr, "No devices found\n");
         return 1;
     }
-    std::string endpoint = params.host + ":" + std::to_string(params.port);
+    // accept both "addr" and "[addr]" spellings of an IPv6 literal, then bracket
+    // it so that the "host:port" endpoint stays unambiguous
+    std::string rpc_host = params.host;
+    if (rpc_host.size() >= 2 && rpc_host.front() == '[' && rpc_host.back() == ']') {
+        rpc_host = rpc_host.substr(1, rpc_host.size() - 2);
+    }
+    std::string endpoint = rpc_host.find(':') != std::string::npos
+        ? "[" + rpc_host + "]" : rpc_host;
+    endpoint += ":" + std::to_string(params.port);
     const char * cache_dir = nullptr;
     std::string cache_dir_str;
     if (params.use_cache) {

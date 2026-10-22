@@ -8,6 +8,7 @@
 #  endif
 #  include <windows.h>
 #  include <winsock2.h>
+#  include <ws2tcpip.h> // getaddrinfo / sockaddr_storage
 #else
 #  include <arpa/inet.h>
 #  include <sys/socket.h>
@@ -21,6 +22,7 @@
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <string>
 
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
@@ -721,57 +723,122 @@ socket_ptr socket_t::accept() {
     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
 }
 
-socket_ptr socket_t::create_server(const char * host, int port) {
-    auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
+// close a socket descriptor, ignoring errors
+static void sock_close(sockfd_t sockfd) {
+#ifdef _WIN32
+    closesocket(sockfd);
+#else
+    ::close(sockfd);
+#endif
+}
+
+// bind and listen on a single resolved address, returning the listening socket
+static std::optional<sockfd_t> bind_and_listen(const struct addrinfo * ai) {
+    auto sockfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
     if (!is_valid_fd(sockfd)) {
-        return nullptr;
+        return std::nullopt;
     }
     if (!set_reuse_addr(sockfd)) {
         LOG_ERROR("Failed to set SO_REUSEADDR\n");
-        return nullptr;
+        sock_close(sockfd);
+        return std::nullopt;
     }
-    if (inet_addr(host) == INADDR_NONE) {
-        LOG_ERROR("Invalid host address: %s\n", host);
-        return nullptr;
+    if (ai->ai_family == AF_INET6) {
+        // accept IPv4-mapped connections on the same socket
+        int v6only = 0;
+        (void) setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY, (const char *) &v6only, sizeof(v6only));
     }
-    struct sockaddr_in serv_addr;
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = inet_addr(host);
-    serv_addr.sin_port = htons(port);
+    if (bind(sockfd, ai->ai_addr, (int) ai->ai_addrlen) != 0 || listen(sockfd, 1) != 0) {
+        sock_close(sockfd);
+        return std::nullopt;
+    }
+    return sockfd;
+}
 
-    if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
+socket_ptr socket_t::create_server(const char * host, int port) {
+    // tolerate a bracketed IPv6 literal ("[::1]") as well as a bare one
+    std::string host_str = host != nullptr ? host : "";
+    if (host_str.size() >= 2 && host_str.front() == '[' && host_str.back() == ']') {
+        host_str = host_str.substr(1, host_str.size() - 2);
+    }
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;  // IPv4 or IPv6
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags    = AI_PASSIVE; // wildcard bind when the node is NULL
+
+    // an empty host (or the IPv4 wildcard literal) means "listen on every address"
+    const bool any_addr = (host_str.empty() || host_str == "0.0.0.0");
+
+    const std::string port_str = std::to_string(port);
+    struct addrinfo * res = nullptr;
+    const int gai = getaddrinfo(any_addr ? nullptr : host_str.c_str(), port_str.c_str(), &hints, &res);
+    if (gai != 0) {
+        LOG_ERROR("Invalid host address '%s': %s\n", any_addr ? "(any)" : host_str.c_str(), gai_strerror(gai));
         return nullptr;
     }
-    if (listen(sockfd, 1) < 0) {
-        return nullptr;
+
+    // for a wildcard bind try IPv6 first: with IPV6_V6ONLY cleared a single socket
+    // accepts both families, and IPv4 is kept as a fallback
+    for (int pass = 0; pass < 2; pass++) {
+        if (!any_addr && pass > 0) {
+            break;
+        }
+        for (struct addrinfo * ai = res; ai != nullptr; ai = ai->ai_next) {
+            if (any_addr && ai->ai_family != (pass == 0 ? AF_INET6 : AF_INET)) {
+                continue;
+            }
+            auto sockfd = bind_and_listen(ai);
+            if (!sockfd) {
+                continue;
+            }
+            freeaddrinfo(res);
+            LOG_DBG("[%s] listening on %s:%d\n", __func__, any_addr ? "(any)" : host_str.c_str(), port);
+            return socket_ptr(new socket_t(std::make_unique<impl>(*sockfd)));
+        }
     }
-    LOG_DBG("[%s] listening on %s:%d\n", __func__, host, port);
-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+
+    freeaddrinfo(res);
+    LOG_ERROR("Failed to bind %s:%d\n", any_addr ? "(any)" : host_str.c_str(), port);
+    return nullptr;
 }
 
 socket_ptr socket_t::connect(const char * host, int port) {
-    auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (!is_valid_fd(sockfd)) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;  // try every address the host resolves to
+    hints.ai_socktype = SOCK_STREAM;
+
+    const std::string port_str = std::to_string(port);
+    struct addrinfo * res = nullptr;
+    const int gai = getaddrinfo(host, port_str.c_str(), &hints, &res);
+    if (gai != 0) {
+        LOG_ERROR("Cannot resolve host '%s': %s\n", host != nullptr ? host : "(null)", gai_strerror(gai));
         return nullptr;
     }
-    if (!set_no_delay(sockfd)) {
-        LOG_ERROR("Failed to set TCP_NODELAY\n");
-        return nullptr;
+
+    for (struct addrinfo * ai = res; ai != nullptr; ai = ai->ai_next) {
+        auto sockfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (!is_valid_fd(sockfd)) {
+            continue;
+        }
+        if (!set_no_delay(sockfd)) {
+            LOG_ERROR("Failed to set TCP_NODELAY\n");
+            sock_close(sockfd);
+            continue;
+        }
+        if (::connect(sockfd, ai->ai_addr, (int) ai->ai_addrlen) == 0) {
+            freeaddrinfo(res);
+            LOG_DBG("[%s] connected to %s:%d\n", __func__, host, port);
+            return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+        }
+        sock_close(sockfd);
     }
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    struct hostent * server = gethostbyname(host);
-    if (server == NULL) {
-        LOG_ERROR("Cannot resolve host '%s'\n", host);
-        return nullptr;
-    }
-    memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
-    if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        return nullptr;
-    }
-    LOG_DBG("[%s] connected to %s:%d\n", __func__, host, port);
-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+
+    freeaddrinfo(res);
+    LOG_ERROR("Failed to connect to %s:%d\n", host != nullptr ? host : "(null)", port);
+    return nullptr;
 }
 
 #ifdef _WIN32
