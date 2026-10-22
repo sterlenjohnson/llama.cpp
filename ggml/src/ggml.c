@@ -583,6 +583,64 @@ int64_t ggml_time_us(void) {
 }
 #endif
 
+#define GGML_HP_SLOTS 32
+static int  ggml_hp_enabled = -1;
+static bool ggml_hp_act = false;
+static int64_t ggml_hp_ns[GGML_HP_SLOTS];
+static int64_t ggml_hp_n[GGML_HP_SLOTS];
+static const char * ggml_hp_names[GGML_HP_SLOTS] = {
+    "decode", "process_ubatch", "build+alloc", "set_inputs", "graph_compute", "sched_copy_input", "moe_copy_cb",
+    "moe_plan", "vk_graph_compute", "vk_synchronize", "vk_fence_wait", "logits_extract", "cpu_graph_compute",
+    "sample", "sched_prev_sync", "moe_ids_get+sync", "vk_build_graph", "vk_tensor_get_async", "vk_tensor_set_async",
+    "llama_synchronize", "sched_compute_splits", "vk_flops_per_node", "vk_fusion_chain", "vk_submit_after", "slot24", "slot25", "slot26",
+    "slot27", "slot28", "slot29", "slot30", "slot31"
+};
+
+bool ggml_hp_on(void) {
+    if (ggml_hp_enabled < 0) {
+        const char * e = getenv("GGML_HOST_PROF");
+        ggml_hp_enabled = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return ggml_hp_enabled == 1;
+}
+
+void ggml_hp_active(bool active) {
+    ggml_hp_act = active;
+}
+
+int64_t ggml_hp_now(void) {
+    if (!ggml_hp_act || !ggml_hp_on()) {
+        return -1;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t) ts.tv_sec*1000000000LL + ts.tv_nsec;
+}
+
+void ggml_hp_add(int slot, int64_t t0_ns) {
+    if (t0_ns < 0) {
+        return;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ggml_hp_ns[slot] += (int64_t) ts.tv_sec*1000000000LL + ts.tv_nsec - t0_ns;
+    ggml_hp_n[slot]++;
+}
+
+void ggml_hp_report(void) {
+    if (!ggml_hp_on() || ggml_hp_n[0] == 0) {
+        return;
+    }
+    const double nt = (double) ggml_hp_n[0];
+    fprintf(stderr, "ggml_hp: per decoded token (n=%.0f), inclusive ms and calls/token\n", nt);
+    for (int i = 0; i < GGML_HP_SLOTS; i++) {
+        if (ggml_hp_n[i] == 0) {
+            continue;
+        }
+        fprintf(stderr, "ggml_hp: %-22s %8.3f ms/tok  %7.1f calls/tok\n", ggml_hp_names[i], ggml_hp_ns[i]/1e6/nt, ggml_hp_n[i]/nt);
+    }
+}
+
 int64_t ggml_cycles(void) {
     return clock();
 }

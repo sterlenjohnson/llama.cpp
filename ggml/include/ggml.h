@@ -743,6 +743,13 @@ extern "C" {
     GGML_API void    ggml_time_init(void); // call this once at the beginning of the program
     GGML_API int64_t ggml_time_ms(void);
     GGML_API int64_t ggml_time_us(void);
+
+    // host-overhead profiler (GGML_HOST_PROF=1): per-slot accumulated wall time, reported by ggml_hp_report
+    GGML_API bool    ggml_hp_on(void);
+    GGML_API void    ggml_hp_active(bool active);
+    GGML_API int64_t ggml_hp_now(void);
+    GGML_API void    ggml_hp_add(int slot, int64_t t0_ns);
+    GGML_API void    ggml_hp_report(void);
     GGML_API int64_t ggml_cycles(void);
     GGML_API int64_t ggml_cycles_per_ms(void);
 

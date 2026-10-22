@@ -1,3 +1,4 @@
+#include "ggml-hp.h"
 #include "sampling.h"
 
 #include "common.h"
@@ -124,6 +125,13 @@ struct common_sampler {
 
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
+
+    // LLAMA_GREEDY_FAST=1: the chain is equivalent to an argmax over the logits (greedy, no penalties, no grammar,
+    // only non-positive logit biases), so common_sampler_sample takes the argmax directly instead of building a
+    // llama_token_data per vocab entry and running top-k/top-p/min-p/temperature on it
+    bool greedy_fast = false;
+    // tokens with a (negative) logit bias: the fast path defers to the chain if the argmax is one of them
+    std::vector<llama_token> biased;
 
     void reset() {
         prev.clear();
@@ -431,6 +439,57 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
+    std::vector<llama_token> gsmpl_biased;
+    bool greedy_fast = false;
+    {
+        const char * e = getenv("LLAMA_GREEDY_FAST");
+        const bool env_on = e && atoi(e) != 0;
+        bool eligible = env_on && params.mirostat == 0 && !grmr && !rbudget && params.n_probs == 0 && !params.backend_sampling &&
+            !params.samplers.empty() &&
+            ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
+             (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
+        for (const auto & cnstr : params.samplers) {
+            switch (cnstr) {
+                case COMMON_SAMPLER_TYPE_PENALTIES:
+                    eligible = eligible && (params.penalty_last_n == 0 ||
+                        (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f));
+                    break;
+                case COMMON_SAMPLER_TYPE_DRY:
+                    eligible = eligible && (params.dry_multiplier == 0.0f || params.dry_base < 1.0f || params.dry_penalty_last_n == 0);
+                    break;
+                case COMMON_SAMPLER_TYPE_XTC:
+                    eligible = eligible && params.xtc_probability <= 0.0f;
+                    break;
+                case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                    eligible = eligible && params.typ_p >= 1.0f;
+                    break;
+                case COMMON_SAMPLER_TYPE_INFILL:
+                case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
+                    eligible = false;
+                    break;
+                default:
+                    break;
+            }
+        }
+        std::vector<llama_token> biased;
+        {
+            for (const auto & b : params.logit_bias) {
+                eligible = eligible && b.bias <= 0.0f;
+                biased.push_back(b.token);
+            }
+            int32_t n_suppress = 0;
+            const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+            for (int32_t i = 0; i < n_suppress; ++i) {
+                biased.push_back(suppress[i]);
+            }
+        }
+        greedy_fast = eligible;
+        if (greedy_fast) {
+            LOG_INF("%s: LLAMA_GREEDY_FAST: sampling is an argmax over the logits\n", __func__);
+        }
+        gsmpl_biased = std::move(biased);
+    }
+
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .grmr    = */ grmr,
@@ -441,6 +500,8 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+        /* .greedy_fast = */ greedy_fast,
+        /* .biased  = */ std::move(gsmpl_biased),
     };
 
     return result;
@@ -604,7 +665,11 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
-    llama_synchronize(ctx);
+    {
+        GGML_HP(GGML_HP_LLAMA_SYNC);
+        llama_synchronize(ctx);
+    }
+    GGML_HP(GGML_HP_SAMPLE);
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
@@ -615,6 +680,29 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & rbudget = gsmpl->rbudget;
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+
+    if (gsmpl->greedy_fast && llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL &&
+        llama_get_sampled_probs_ith(ctx, idx) == nullptr && llama_get_sampled_logits_ith(ctx, idx) == nullptr) {
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+
+        // the first index of the maximum, like the greedy sampler on the candidates in token order
+        int best = 0;
+        float best_logit = logits[0];
+        for (int i = 1; i < n_vocab; ++i) {
+            if (logits[i] > best_logit) {
+                best_logit = logits[i];
+                best = i;
+            }
+        }
+        if (std::find(gsmpl->biased.begin(), gsmpl->biased.end(), best) == gsmpl->biased.end()) {
+            // keep the candidates of the last sample consistent with the chain's result: the single token
+            gsmpl->cur.assign(1, llama_token_data{ best, best_logit, 1.0f });
+            cur_p = { gsmpl->cur.data(), 1, 0, true };
+            return best;
+        }
+    }
 
     gsmpl->set_logits(ctx, idx);
 

@@ -1,3 +1,4 @@
+#include "ggml-hp.h"
 #include "llama-context.h"
 
 #include "ggml.h"
@@ -585,6 +586,7 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    ggml_hp_report();
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -1523,6 +1525,7 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    GGML_HP(GGML_HP_PROCESS_UBATCH);
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1548,6 +1551,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        GGML_HP(GGML_HP_BUILD);
         gf_res_prev_active = nullptr;
         res->reset();
 
@@ -1580,12 +1584,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        GGML_HP(GGML_HP_SET_INPUTS);
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    ggml_status status;
+    {
+        GGML_HP(GGML_HP_GRAPH_COMPUTE);
+        status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1837,6 +1846,8 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    ggml_hp_active(batch_inp.tokens.size() == 1);
+    GGML_HP(GGML_HP_DECODE);
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2778,6 +2789,7 @@ ggml_status llama_context::graph_compute(
 }
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
+    GGML_HP(GGML_HP_MOE_CB);
     auto * lctx = static_cast<llama_context *>(user_data);
 
     // the slot maps of the MoE cache

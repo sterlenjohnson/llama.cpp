@@ -1308,6 +1308,23 @@ struct ggml_backend_vk_context {
     vk_command_pool compute_cmd_pool;
     vk_command_pool transfer_cmd_pool;
 
+    // GGML_VK_PLAN_CACHE: per-node fusion decisions and flops of a scheduler split, keyed by cgraph->uid.
+    // A uid names one split of one scheduled graph, so while the graph is reused (every decoded token) the
+    // decisions are the same as the ones that were computed for the first token.
+    struct vk_node_plan {
+        bool valid {};
+        int32_t n_extra {};
+        int32_t write_mask {};
+        topk_moe_mode topk_mode {};
+        rms_norm_mode rms_mode {};
+        bool topk_scale {};
+        bool topk_qsa {};
+        bool hc_post_gate {};
+        const char * fusion_string {};
+        uint64_t flops {};
+    };
+    std::unordered_map<uint64_t, std::vector<vk_node_plan>> node_plans;
+
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
     int num_additional_fused_ops {};

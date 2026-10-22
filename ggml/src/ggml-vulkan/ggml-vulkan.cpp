@@ -1,3 +1,4 @@
+#include "ggml-hp.h"
 #include "ggml-vulkan-common.h"
 
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
@@ -337,6 +338,7 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
 }
 
 void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+    GGML_HP(GGML_HP_VK_FENCE);
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
     // during this wait.
     if (ctx->almost_ready_fence_pending) {
@@ -13727,6 +13729,7 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
+    GGML_HP(GGML_HP_VK_SYNC);
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
@@ -14477,6 +14480,7 @@ static int32_t find_first_set(uint32_t x) {
 }
 
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    GGML_HP(GGML_HP_VK_GRAPH_COMPUTE);
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
@@ -14572,7 +14576,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
         }
     }
-    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    // GGML_VK_SUBMIT_DIV: a graph is submitted in about this many batches (default 40); 0 disables the flop-based flush
+    static const uint32_t submit_div = [] { const char * e = getenv("GGML_VK_SUBMIT_DIV"); return e ? (uint32_t) std::stoul(e) : 40u; }();
+    uint64_t flops_per_submit = submit_div == 0 ? 0 : std::min(flops_cap, ctx->last_total_flops / submit_div);
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -14604,13 +14610,29 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         submit_count++;
     };
 
+    // GGML_VK_PLAN_CACHE: 0 off (default), 1 reuse the fusion decisions of the previous run of this split, 2 also recompute and check them
+    static const int plan_mode = [] { const char * e = getenv("GGML_VK_PLAN_CACHE"); return e ? atoi(e) : 0; }();
+    std::vector<ggml_backend_vk_context::vk_node_plan> * plan_vec = nullptr;
+    if (plan_mode != 0 && cgraph->uid != 0 && !ctx->device->disable_fusion) {
+        if (ctx->node_plans.size() >= 512) {
+            ctx->node_plans.clear();
+        }
+        plan_vec = &ctx->node_plans[cgraph->uid];
+        if ((int) plan_vec->size() != cgraph->n_nodes) {
+            plan_vec->assign(cgraph->n_nodes, {});
+        }
+    }
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
             submit_node_idx = i;
         }
+        ggml_backend_vk_context::vk_node_plan * plan = plan_vec ? &(*plan_vec)[i] : nullptr;
+        const bool plan_have = plan && plan->valid;
 
         {
-            auto node_flops = ggml_vk_get_node_flops(cgraph->nodes[i]);
+            GGML_HP(GGML_HP_VK_SUBMIT);
+            const uint64_t node_flops = plan_have ? plan->flops : ggml_vk_get_node_flops(cgraph->nodes[i]);
             total_flops += node_flops;
 
             // Flush the current batch before recording a node that would push it over the flop threshold
@@ -14627,6 +14649,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             batch_flops += node_flops;
         }
 
+        const char *fusion_string {};
+        const bool plan_use = plan_have && plan_mode == 1;
+        if (plan_use) {
+            ctx->num_additional_fused_ops = plan->n_extra;
+            ctx->fused_ops_write_mask = plan->write_mask;
+            ctx->fused_topk_moe_mode = plan->topk_mode;
+            ctx->fused_topk_moe_scale = plan->topk_scale;
+            ctx->fused_topk_qsa = plan->topk_qsa;
+            ctx->fused_hc_post_gate = plan->hc_post_gate;
+            ctx->fused_rms_norm_mode = plan->rms_mode;
+            fusion_string = plan->fusion_string;
+        } else {
         // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
         // the fused result in an elementwise-way. This affects whether the memory for
         // the src is allowed to overlap the memory for the destination.
@@ -14638,8 +14672,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
-        const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
+            GGML_HP(GGML_HP_POOL_WAKE);
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
@@ -14884,6 +14918,28 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
 
+        if (plan && !ctx->device->disable_fusion) {
+            if (plan_have) {
+                GGML_ASSERT(plan->n_extra == ctx->num_additional_fused_ops && plan->write_mask == ctx->fused_ops_write_mask &&
+                            plan->topk_mode == ctx->fused_topk_moe_mode && plan->topk_scale == ctx->fused_topk_moe_scale &&
+                            plan->topk_qsa == ctx->fused_topk_qsa && plan->hc_post_gate == ctx->fused_hc_post_gate &&
+                            plan->rms_mode == ctx->fused_rms_norm_mode && plan->fusion_string == fusion_string &&
+                            "GGML_VK_PLAN_CACHE=2: the cached fusion decision differs from the computed one");
+            } else {
+                plan->n_extra = ctx->num_additional_fused_ops;
+                plan->write_mask = ctx->fused_ops_write_mask;
+                plan->topk_mode = ctx->fused_topk_moe_mode;
+                plan->topk_scale = ctx->fused_topk_moe_scale;
+                plan->topk_qsa = ctx->fused_topk_qsa;
+                plan->hc_post_gate = ctx->fused_hc_post_gate;
+                plan->rms_mode = ctx->fused_rms_norm_mode;
+                plan->fusion_string = fusion_string;
+                plan->flops = ggml_vk_get_node_flops(cgraph->nodes[i]);
+                plan->valid = true;
+            }
+        }
+        } // !plan_use
+
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
         bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
@@ -14891,7 +14947,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
-        bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+        bool enqueued;
+        {
+            GGML_HP(GGML_HP_VK_BUILD);
+            enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+        }
 
         if (vk_perf_logger_enabled && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -14919,6 +14979,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
 
         if (submit && enqueued) {
+            GGML_HP(GGML_HP_SUBMIT_AFTER);
             submit_after(submit_node_idx, i + (int)ctx->num_additional_fused_ops);
         }
         i += ctx->num_additional_fused_ops;

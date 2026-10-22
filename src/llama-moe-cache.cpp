@@ -1,3 +1,4 @@
+#include "ggml-hp.h"
 #include "llama-moe-cache.h"
 
 #include "llama-impl.h"
@@ -927,12 +928,18 @@ struct llama_moe_cache::impl {
             ids.resize(n_ids);
             ids_data = ids.data();
         }
-        ggml_backend_tensor_get_async(backend, sel, ids_data, 0, ggml_nbytes(sel));
-        ggml_backend_synchronize(backend);
+        {
+            GGML_HP(GGML_HP_MOE_IDS);
+            ggml_backend_tensor_get_async(backend, sel, ids_data, 0, ggml_nbytes(sel));
+            ggml_backend_synchronize(backend);
+        }
 
         size_t n_hit = 0;
-        if (!g.slru.plan(il, ids_data, n_ids, fills, n_hit)) {
-            GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+        {
+            GGML_HP(GGML_HP_MOE_PLAN);
+            if (!g.slru.plan(il, ids_data, n_ids, fills, n_hit)) {
+                GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+            }
         }
         // profile capture: count distinct selected experts for this layer
         if (il >= 0 && il < n_layers && expert_counts.size() == (size_t)n_layers * n_expert) {

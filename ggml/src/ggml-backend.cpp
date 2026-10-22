@@ -10,6 +10,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-hp.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -403,6 +404,7 @@ size_t ggml_backend_get_max_size(ggml_backend_t backend) {
 }
 
 void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    GGML_HP(GGML_HP_VK_SET);
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
@@ -417,6 +419,7 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
 }
 
 void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    GGML_HP(GGML_HP_VK_GET);
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
@@ -1821,6 +1824,7 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
 }
 
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+    GGML_HP(GGML_HP_SCHED_COPY_INPUT);
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
@@ -1877,6 +1881,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    GGML_HP(GGML_HP_SPLITS);
     struct ggml_backend_sched_split * splits = sched->splits;
 
     int prev_backend_id = -1;
@@ -1889,6 +1894,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            GGML_HP(GGML_HP_SCHED_PREV_SYNC);
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
