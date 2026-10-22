@@ -1031,6 +1031,14 @@ struct vk_device_struct {
     bool disable_q2_0_mmvq_t;
     // Q4_0 MMVQ with one lane per block and B reused over rows. GGML_VK_DISABLE_Q4_0_MMVQ_T restores upstream.
     bool disable_q4_0_mmvq_t;
+    // Integer-dot (MMVQ) mat-vec for IQ2_XXS: the 2-bit codebook magnitudes are 8..43, so they fit
+    // int8 exactly and the whole sub-block can go through dp4a with only the sign applied in
+    // registers. Upstream has no int8 path for it; its float DMMV re-derives every sign with fma.
+    // GGML_VK_DISABLE_IQ2_XXS_MMVQ restores the upstream float DMMV path.
+    bool disable_iq2_xxs_mmvq;
+    // Integer-dot (MMQ) mat-mul for IQ2_S in the batched matmul family, the prefill-side counterpart
+    // of the ported IQ2_S/IQ3_S DMMV kernels. GGML_VK_DISABLE_IQ2_S_MMQ restores the f16 path.
+    bool disable_iq2_s_mmq;
     uint32_t fa_split_k_mult; // tuning aid: forces the FA split_k occupancy multiplier (0 = auto)
     bool disable_fa_qsplit;   // GGML_VK_DISABLE_FA_QSPLIT: no extra FA split_k for quantized KV on RDNA1
 

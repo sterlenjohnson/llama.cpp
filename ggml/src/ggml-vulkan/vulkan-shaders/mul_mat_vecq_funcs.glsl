@@ -470,6 +470,140 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
 }
 #endif
 
+#if defined(DATA_A_IQ2_XXS)
+// One call covers the 32 weights of a single sub-block: four 8-weight codebook entries (l = 0..3),
+// each with its own 7-bit sign field out of the packed word u.
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    const uint ib   = ib_a / 8; // 256-weight block
+    const uint ib32 = ib_a % 8; // 32-weight sub-block
+
+    // The 8 bytes of sub-block ib32 are four grid indices followed by u: bits 28-31 hold the
+    // block scale and bits 7*l..7*l+6 the signs of weights 8l..8l+6.
+    const uint u = pack32(u16vec2(data_a_packed16[ib].qs[4 * ib32 + 2],
+                                  data_a_packed16[ib].qs[4 * ib32 + 3]));
+
+    int32_t q_sum = 0;
+    [[unroll]] for (uint l = 0; l < 4; ++l) {
+        const uvec2 grid = iq2xxs_grid[data_a[ib].qs[8 * ib32 + l]];
+        const u8vec4 g0 = unpack8(grid.x); // weights 8l+0 .. 8l+3
+        const u8vec4 g1 = unpack8(grid.y); // weights 8l+4 .. 8l+7
+
+        // ggml packs only 7 sign bits per eight weights and stores the 8th as their parity.
+        const uint sign = bitfieldExtract(u, 7 * int(l), 7);
+        const uint s = sign | ((uint(bitCount(sign)) & 1u) << 7);
+
+        // The codebook stores magnitudes only (8..43), so the sign is applied here. Every value
+        // fits int8 and the dot below is exhaustively exact in int32.
+        const i8vec4 a0 = i8vec4((s &   1u) != 0u ? -int8_t(g0.x) : int8_t(g0.x),
+                                 (s &   2u) != 0u ? -int8_t(g0.y) : int8_t(g0.y),
+                                 (s &   4u) != 0u ? -int8_t(g0.z) : int8_t(g0.z),
+                                 (s &   8u) != 0u ? -int8_t(g0.w) : int8_t(g0.w));
+        const i8vec4 a1 = i8vec4((s &  16u) != 0u ? -int8_t(g1.x) : int8_t(g1.x),
+                                 (s &  32u) != 0u ? -int8_t(g1.y) : int8_t(g1.y),
+                                 (s &  64u) != 0u ? -int8_t(g1.z) : int8_t(g1.z),
+                                 (s & 128u) != 0u ? -int8_t(g1.w) : int8_t(g1.w));
+
+        q_sum += dotPacked4x8EXT(pack32(a0), cache_b_qs[2 * l + 0]);
+        q_sum += dotPacked4x8EXT(pack32(a1), cache_b_qs[2 * l + 1]);
+    }
+
+    const float db = float(data_a[ib].d) * 0.25 * (0.5 + float(u >> 28));
+    return FLOAT_TYPE(float(cache_b_ds.x) * db * float(q_sum));
+}
+#endif
+
+#if defined(DATA_A_IQ2_S)
+// One call covers the 32 weights of a single sub-block: four 8-weight codebook entries (l = 0..3) of
+// 2-bit magnitudes, each with one byte of sign bits, and the sub-block's two 16-weight halves carry
+// their own 4-bit scale out of data_a[ib].scales[ib32] (low nibble first, high nibble second).
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    const uint ib   = ib_a / 8; // 256-weight block
+    const uint ib32 = ib_a % 8; // 32-weight sub-block
+
+    const uint qh  = data_a[ib].qh[ib32];
+    const uint sc0 = uint(data_a[ib].scales[ib32]) & 0x0Fu; // weights  0..15
+    const uint sc1 = uint(data_a[ib].scales[ib32]) >> 4u;   // weights 16..31
+
+    // qs[] holds 32 grid bytes then 32 sign bytes, four of each per sub-block: entry L uses grid
+    // byte 4*ib32 + L, sign byte 32 + 4*ib32 + L, and two further index bits out of qh.
+    int32_t q_sum0 = 0;
+    int32_t q_sum1 = 0;
+    [[unroll]] for (uint h = 0; h < 2; ++h) {
+        const u8vec2 gb = unpack8(uint32_t(data_a_packed16[ib].qs[2 * ib32 + h])).xy;
+        const u8vec2 sb = unpack8(uint32_t(data_a_packed16[ib].qs[16 + 2 * ib32 + h])).xy;
+
+        [[unroll]] for (uint ll = 0; ll < 2; ++ll) {
+            const uint sign = uint(ll == 0u ? sb.x : sb.y);
+            const uint qs   = uint(ll == 0u ? gb.x : gb.y) | ((qh << (8u - 4u * h - 2u * ll)) & 0x300u);
+
+            const uvec2 grid = iq2s_grid[qs];
+            const u8vec4 g0 = unpack8(grid.x); // weights 8*(2*h + ll) + 0..3
+            const u8vec4 g1 = unpack8(grid.y); // weights 8*(2*h + ll) + 4..7
+
+            const i8vec4 a0 = i8vec4((sign &   1u) != 0u ? -int8_t(g0.x) : int8_t(g0.x),
+                                     (sign &   2u) != 0u ? -int8_t(g0.y) : int8_t(g0.y),
+                                     (sign &   4u) != 0u ? -int8_t(g0.z) : int8_t(g0.z),
+                                     (sign &   8u) != 0u ? -int8_t(g0.w) : int8_t(g0.w));
+            const i8vec4 a1 = i8vec4((sign &  16u) != 0u ? -int8_t(g1.x) : int8_t(g1.x),
+                                     (sign &  32u) != 0u ? -int8_t(g1.y) : int8_t(g1.y),
+                                     (sign &  64u) != 0u ? -int8_t(g1.z) : int8_t(g1.z),
+                                     (sign & 128u) != 0u ? -int8_t(g1.w) : int8_t(g1.w));
+
+            const uint w = 4u * h + 2u * ll; // the entry's two q8_1 words
+            if (h == 0u) {
+                q_sum0 += dotPacked4x8EXT(pack32(a0), cache_b_qs[w + 0u]);
+                q_sum0 += dotPacked4x8EXT(pack32(a1), cache_b_qs[w + 1u]);
+            } else {
+                q_sum1 += dotPacked4x8EXT(pack32(a0), cache_b_qs[w + 0u]);
+                q_sum1 += dotPacked4x8EXT(pack32(a1), cache_b_qs[w + 1u]);
+            }
+        }
+    }
+
+    const float dh = float(data_a[ib].d) * 0.25;
+    return FLOAT_TYPE(float(cache_b_ds.x) * dh * ((0.5 + float(sc0)) * float(q_sum0) +
+                                                  (0.5 + float(sc1)) * float(q_sum1)));
+}
+#endif
+
+#if defined(DATA_A_IQ3_S)
+// One call covers the 32 weights of a single sub-block: eight grid bytes holding two indices into
+// iq3s_grid each (four 4-bit magnitudes apiece, a ninth index bit out of qh), two of them sharing
+// one byte of sign bits, and one 4-bit scale for the whole sub-block: d * (1 + 2*sc).
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    const uint ib   = ib_a / 8; // 256-weight block
+    const uint ib32 = ib_a % 8; // 32-weight sub-block
+
+    const uint qh = data_a[ib].qh[ib32];
+    const uint sc = (uint(data_a[ib].scales[ib32 / 2]) >> (4u * (ib32 & 1u))) & 0x0Fu;
+
+    int32_t q_sum = 0;
+    [[unroll]] for (uint l = 0; l < 4; ++l) {
+        const u8vec2 gb   = unpack8(uint32_t(data_a_packed16[ib].qs[4 * ib32 + l])).xy;
+        const uint  sign  = uint(data_a[ib].signs[4 * ib32 + l]);
+        const uint  qs0   = uint(gb.x) | ((qh << (8u - 2u * l)) & 0x100u);
+        const uint  qs1   = uint(gb.y) | ((qh << (7u - 2u * l)) & 0x100u);
+
+        const u8vec4 g0 = unpack8(iq3s_grid[qs0]); // weights 8*l + 0..3
+        const u8vec4 g1 = unpack8(iq3s_grid[qs1]); // weights 8*l + 4..7
+
+        const i8vec4 a0 = i8vec4((sign &   1u) != 0u ? -int8_t(g0.x) : int8_t(g0.x),
+                                 (sign &   2u) != 0u ? -int8_t(g0.y) : int8_t(g0.y),
+                                 (sign &   4u) != 0u ? -int8_t(g0.z) : int8_t(g0.z),
+                                 (sign &   8u) != 0u ? -int8_t(g0.w) : int8_t(g0.w));
+        const i8vec4 a1 = i8vec4((sign &  16u) != 0u ? -int8_t(g1.x) : int8_t(g1.x),
+                                 (sign &  32u) != 0u ? -int8_t(g1.y) : int8_t(g1.y),
+                                 (sign &  64u) != 0u ? -int8_t(g1.z) : int8_t(g1.z),
+                                 (sign & 128u) != 0u ? -int8_t(g1.w) : int8_t(g1.w));
+
+        q_sum += dotPacked4x8EXT(pack32(a0), cache_b_qs[2u * l + 0u]);
+        q_sum += dotPacked4x8EXT(pack32(a1), cache_b_qs[2u * l + 1u]);
+    }
+
+    return FLOAT_TYPE(float(cache_b_ds.x) * float(data_a[ib].d) * float(1 + 2 * int(sc)) * float(q_sum));
+}
+#endif
+
 #if defined(DATA_A_IQ1_S)
 void repack8(uint ib, uint iqs, out i32vec4 out0, out i32vec4 out1) {
     const uint ib32 = iqs / 32;

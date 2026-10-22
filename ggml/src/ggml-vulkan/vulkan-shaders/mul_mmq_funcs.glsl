@@ -648,6 +648,78 @@ ACC_TYPE mmq_dot_product(const uint ib_a) {
 }
 #endif
 
+#if defined(DATA_A_IQ2_S)
+// 2-byte loads for IQ2_S blocks (82 bytes).  A 32-weight sub-block has four 8-weight codebook
+// entries; entry l takes one grid byte out of qs[4*ib32 + l], two high index bits out of qh[ib32],
+// one sign byte out of the second half of qs, and one of the sub-block's two 4-bit scales (entries
+// 0-1 use the low nibble of scales[ib32], entries 2-3 the high nibble).  QUANT_R_MMQ = 2 gives one
+// entry per iqs, i.e. two int32 words, which is the same 8 words per 32 weights as Q6_K.
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs, const bool is_in_bounds) {
+    if (is_in_bounds) {
+        const uint ib_k  = ib / 8;
+        const uint ib32  = ib % 8;
+
+        const uint qh   = uint(data_a[ib_k].qh[ib32]);
+        // entries are 0..3 inside the sub-block, so iqs is the entry index here
+        const uint qs   = uint(data_a[ib_k].qs[4 * ib32 + iqs]) | ((qh << (8 - 2 * iqs)) & 0x300u);
+        const uint sign = uint(data_a[ib_k].qs[QUANT_K / 8 + 4 * ib32 + iqs]);
+
+        // grid holds 8 values of 8..43, one per byte
+        const ivec4 vals0 = ivec4(unpack8(iq2s_grid[qs].x));
+        const ivec4 vals1 = ivec4(unpack8(iq2s_grid[qs].y));
+
+        // negate with (v ^ -s) - -s to avoid branches
+        const ivec4 m0 = -(ivec4(sign,      sign >> 1, sign >> 2, sign >> 3) & 1);
+        const ivec4 m1 = -(ivec4(sign >> 4, sign >> 5, sign >> 6, sign >> 7) & 1);
+
+        buf_a[buf_ib].qs[2 * iqs    ] = pack32(i8vec4((vals0 ^ m0) - m0));
+        buf_a[buf_ib].qs[2 * iqs + 1] = pack32(i8vec4((vals1 ^ m1) - m1));
+
+        if (iqs == 0) {
+            const uint scales = uint(data_a[ib_k].scales[ib32]);
+
+            // dequantize_row_iq2_s: d * (0.5 + scale) * 0.25, one scale per 16 weights
+            const float d = float(data_a[ib_k].d) * 0.25;
+            buf_a[buf_ib].d_scales = FLOAT_TYPEV2(vec2(d * (0.5 + float(scales & 0xFu)),
+                                                       d * (0.5 + float(scales >> 4))));
+        }
+    } else {
+        buf_a[buf_ib].qs[2 * iqs] = 0;
+        buf_a[buf_ib].qs[2 * iqs + 1] = 0;
+
+        if (iqs == 0) {
+            buf_a[buf_ib].d_scales = FLOAT_TYPEV2(0.0f);
+        }
+    }
+}
+
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].d_scales = buf_a[buf_ib].d_scales;
+
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
+    }
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+    float result = 0.0;
+    int32_t q_sum = 0;
+
+    [[unroll]] for (uint iqs = 0; iqs < 4; iqs++) {
+        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
+    }
+    result += float(cache_a[ib_a].d_scales[0]) * float(q_sum);
+    q_sum = 0;
+
+    [[unroll]] for (uint iqs = 4; iqs < 8; iqs++) {
+        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
+    }
+    result += float(cache_a[ib_a].d_scales[1]) * float(q_sum);
+
+    return ACC_TYPE(float(cache_b.ds.x) * result);
+}
+#endif
+
 void block_b_to_shmem(const uint buf_ib, const uint ib, const uint iqs, const bool is_in_bounds) {
     if (is_in_bounds) {
         const uint ib_outer = ib / 4;
