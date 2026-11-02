@@ -4345,8 +4345,17 @@ vk_device ggml_vk_get_device(size_t idx) {
                                       (vk11_props.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eArithmetic);
 #ifdef __APPLE__
         // Workaround for subgroup arithmetic failing on MoltenVK with AMD GPUs (issue 15846)
+        // The workaround stays for MoltenVK older than 1.4.2. On 1.4.2 (Radeon Pro 5600M) subgroup arithmetic gave
+        // matching perplexity on OLMoE, Gemma e4b and Ornith 9B and +2% to +9% decode (MoE models gain most, through the
+        // topk_moe and add+rms_norm fusions it enables). GGML_VK_DISABLE_AMD_MOLTENVK_SUBGROUP_ARITH forces it off again.
         if (device->vendor_id == VK_VENDOR_ID_AMD) {
-            device->subgroup_arithmetic = false;
+            int sg_major = 0, sg_minor = 0, sg_patch = 0;
+            const bool sg_version_known = device->driver_id == vk::DriverId::eMoltenvk &&
+                sscanf(driver_props.driverInfo, "%d.%d.%d", &sg_major, &sg_minor, &sg_patch) == 3;
+            const bool sg_arith_ok = sg_version_known && std::make_tuple(sg_major, sg_minor, sg_patch) >= std::make_tuple(1, 4, 2);
+            if (!sg_arith_ok || getenv("GGML_VK_DISABLE_AMD_MOLTENVK_SUBGROUP_ARITH")) {
+                device->subgroup_arithmetic = false;
+            }
         }
 #endif
         device->subgroup_shuffle = (vk11_props.subgroupSupportedStages & vk::ShaderStageFlagBits::eCompute) &&
