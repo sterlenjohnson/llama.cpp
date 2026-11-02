@@ -47,7 +47,9 @@ shared FLOAT_TYPE temp[SUBGROUP_SIZE];
 
 // This does a reduction across groups of LANES_PER_COLUMN
 FLOAT_TYPE reduce_add_shmem(FLOAT_TYPE partial) {
-    const uint lane = gl_SubgroupInvocationID;
+    // The shared-memory path uses one subgroup-sized workgroup. Use the workgroup-local
+    // lane instead of subgroup built-ins, which MoltenVK can mis-translate on AMD.
+    const uint lane = gl_LocalInvocationID.x;
     temp[lane] = partial;
     barrier();
     [[unroll]] for (uint s = LANES_PER_COLUMN / 2u; s > 0; s >>= 1u) {
@@ -95,8 +97,10 @@ FLOAT_TYPE reduce_partial(FLOAT_TYPE partial) {
 void main() {
     const uint head_id = gl_WorkGroupID.x;
     const uint seq_id = gl_WorkGroupID.y;
-    const uint lane = gl_SubgroupInvocationID % LANES_PER_COLUMN;
-    const uint col = gl_WorkGroupID.z * COLS_PER_WG + (gl_SubgroupInvocationID / LANES_PER_COLUMN);
+    // Keep lane/column addressing independent of MoltenVK subgroup-ID translation.
+    const uint local_id = gl_LocalInvocationID.x;
+    const uint lane = local_id % LANES_PER_COLUMN;
+    const uint col = gl_WorkGroupID.z * COLS_PER_WG + (local_id / LANES_PER_COLUMN);
 
     const uint iq1 = head_id % neq1;
     const uint iq3 = seq_id / rq3;
