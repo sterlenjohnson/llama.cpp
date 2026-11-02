@@ -12711,6 +12711,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t k : {7, 256, 2304, 8193}) {
             for (auto bs_nr : std::vector<std::array<int64_t, 2>>{{1, 1}, {16, 1}, {8, 4}, {2, 8}, {4, 3}, {1, 16}}) {
                 test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, 1, k, {bs_nr[0], 1}, {bs_nr[1], 1}, {0, 1, 2, 3}, (k + 255) / 256 * 256 + 256));
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, 1, k, {bs_nr[0], 1}, {bs_nr[1], 1}));
             }
         }
     }
@@ -14171,6 +14172,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, k, {16, 1}, {1, 1}, {0, 1, 2, 3}, 8704));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, k, {8, 1}, {4, 1}, {0, 1, 2, 3}, 8704));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 64, 1, k, {8, 1}, {4, 1}, {0, 1, 2, 3}, 8704));
+        // contiguous V (cache sized exactly to n_kv, as in llama-bench)
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, k, {8, 1}, {4, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 64, 1, k, {8, 1}, {4, 1}));
     }
     // bandwidth comparison at Bonsai-2 shapes
     for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_TQ2_0}) {

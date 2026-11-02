@@ -7324,10 +7324,11 @@ static bool ggml_vk_mul_mat_vec_nc_mr_f16_f32(ggml_backend_vk_context * ctx, vk_
         return false;
     }
     const uint32_t gqa_ratio = (uint32_t)(ne12 / ne02);
-    // Measured on a Radeon Pro 5600M: the gain comes from sharing V and probability loads across GQA heads, and
-    // shows from about 1024 cache positions (gqa 4, hd 128: 21 -> 18 us at 1024, 146 -> 80 us at 8448). Without
-    // GQA, or with a short cache, the per-row kernel is as fast or faster.
-    if (gqa_ratio < 2 || gqa_ratio > p021_max_gqa_ratio || ne00 < 1024) {
+    // Measured on a Radeon Pro 5600M (gqa 4, hd 128): the gain comes from sharing V and probability loads across
+    // GQA heads and grows with the cache: strided V (nc kernel) 43.5 -> 27 us at 2304 positions, 146 -> 80 us at
+    // 8448; contiguous V (generic mat-vec) 32.6 -> 26 us and 126 -> 76 us. At 1024 positions the generic mat-vec
+    // is still faster (15.7 vs 18.6 us), and without GQA the existing kernels are as fast or faster.
+    if (gqa_ratio < 2 || gqa_ratio > p021_max_gqa_ratio || ne00 < 2048) {
         return false;
     }
     if (src0->nb[0] != sizeof(ggml_fp16_t) || src0->nb[1] % 16 != 0 || src0->nb[2] % 16 != 0 ||
@@ -7771,6 +7772,13 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
                src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
                src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
+    // A contiguous V view (the cache holds exactly n_kv positions) misses the nc path above; the multi-row KQV
+    // kernel still applies and shares loads across GQA heads. It dispatches and returns true when the shapes fit.
+    } else if (ctx->num_additional_fused_ops == 0 &&
+               src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->ne[1] == 1 &&
+               !ggml_is_permuted(src0) && !ggml_is_permuted(src1) && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) &&
+               ggml_vk_mul_mat_vec_nc_mr_f16_f32(ctx, subctx, cgraph, node_idx)) {
+        // dispatched
     // With one output row, B^T*A has the same flat output as A^T*B.
     } else if (ctx->num_additional_fused_ops == 0 &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
