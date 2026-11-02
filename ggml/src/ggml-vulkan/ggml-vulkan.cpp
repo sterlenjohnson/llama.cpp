@@ -2886,10 +2886,6 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             rm_stdq = 2;
             rm_kq = 4;
             rm_stdq_int = 4;
-        } else if (device->driver_id == vk::DriverId::eMoltenvk) {
-            // Radeon Pro 5600M under MoltenVK: 4 rows per workgroup for K-quants decodes ~6% faster on a 9B Q4_K_M
-            // (28.0 -> 29.7 tok/s, two interleaved rounds) and is neutral on Gemma e4b. Standard quants regress at 4 rows.
-            rm_kq = 4;
         }
     } else if (device->vendor_id == VK_VENDOR_ID_INTEL) {
         rm_stdq = 2;
@@ -2906,9 +2902,22 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
         return is_rdna3_or_4 ? 4u : rows;
     };
-    if (const char * v = getenv("GGML_VK_RM_KQ"))   { rm_kq   = (uint32_t) atoi(v); }
-    if (const char * v = getenv("GGML_VK_RM_STDQ")) { rm_stdq = (uint32_t) atoi(v); }
+    // rm_iq is derived before the MoltenVK/env changes below so they affect only plain K-quants: the IQ, MXFP4 and
+    // NVFP4 kernels were not measured at the larger row count.
     uint32_t rm_iq = 2 * rm_kq;
+    if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN && device->driver_id == vk::DriverId::eMoltenvk) {
+        // Radeon Pro 5600M under MoltenVK: 4 rows per workgroup for K-quants decodes ~6% faster on a 9B Q4_K_M
+        // (28.0 -> 29.7 tok/s over two interleaved rounds); the 4B-effective Gemma e4b is unchanged. Not validated on
+        // other AMD Macs.
+        rm_kq = 4;
+    }
+    auto env_rows = [](const char * name, uint32_t fallback) {
+        const char * v = getenv(name);
+        const long n = v ? strtol(v, nullptr, 10) : 0;
+        return (n >= 1 && n <= 8) ? (uint32_t) n : fallback;
+    };
+    rm_kq   = env_rows("GGML_VK_RM_KQ", rm_kq);
+    rm_stdq = env_rows("GGML_VK_RM_STDQ", rm_stdq);
 
     const bool use_subgroups = device->subgroup_arithmetic;
     // The Imagination proprietary compiler rejects the subgroup-only dequant mul_mat_vec
@@ -5230,8 +5239,13 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     const size_t subgroup_size = (default_subgroup_size != 0) ? default_subgroup_size : subgroup_props.subgroupSize;
     const bool uma = props2.properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
 
+    // Mirrors the device-creation rule: AMD under MoltenVK keeps the emulated dot unless GGML_VK_DISABLE_INT_DOT is set.
+    const bool int_dot_emulated_ok = props2.properties.vendorID == VK_VENDOR_ID_AMD
+                                  && driver_props.driverID == vk::DriverId::eMoltenvk
+                                  && !getenv("GGML_VK_DISABLE_INT_DOT");
     integer_dot_product = integer_dot_product
-                       && shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated
+                       && (shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated || int_dot_emulated_ok || getenv("GGML_VK_FORCE_INT_DOT"))
+                       && !getenv("GGML_VK_DISABLE_INT_DOT")
                        && shader_integer_dot_product_features.shaderIntegerDotProduct;
 
     coopmat_support = coopmat_support
