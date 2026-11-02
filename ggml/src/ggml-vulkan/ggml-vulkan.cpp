@@ -1,5 +1,8 @@
 #include "ggml-vulkan-common.h"
 
+#include <cstdio>
+#include <tuple>
+
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
     vk::PhysicalDeviceProperties props = device.getProperties();
 
@@ -4033,10 +4036,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 }
 
-static bool ggml_vk_external_memory_host_usable(vk::DriverId driver_id) {
-    // Disable external_memory_host until https://github.com/KhronosGroup/MoltenVK/pull/2622
-    // is available in the Vulkan SDK.
-    return driver_id != vk::DriverId::eMoltenvk;
+static bool ggml_vk_external_memory_host_usable(const vk::PhysicalDeviceDriverProperties & driver_props) {
+    if (driver_props.driverID != vk::DriverId::eMoltenvk) {
+        return true;
+    }
+    // https://github.com/KhronosGroup/MoltenVK/pull/2622 (the host-memory-handle-type fix) landed in
+    // MoltenVK 1.4.1. Below that, keep external_memory_host disabled; at or above it, the import path is safe.
+    // driverInfo on MoltenVK is a plain "MAJOR.MINOR.PATCH" string (driverVersion is encoded differently).
+    int major = 0, minor = 0, patch = 0;
+    const int parsed = sscanf(driver_props.driverInfo, "%d.%d.%d", &major, &minor, &patch);
+    return parsed == 3 && std::make_tuple(major, minor, patch) >= std::make_tuple(1, 4, 1);
 }
 
 static bool ggml_vk_host_buffer_import_usable(uint32_t vendor_id) {
@@ -4069,6 +4078,23 @@ vk_device ggml_vk_get_device(size_t idx) {
         const std::vector<vk::ExtensionProperties> ext_props = device->physical_device.enumerateDeviceExtensionProperties();
 
         device->architecture = get_device_architecture(device->physical_device);
+        // Architecture detection keys off the reported subgroup size range, which
+        // some drivers do not report faithfully. MoltenVK reports min == max == 32
+        // for AMD RDNA parts, matching neither the GCN (64/64) nor the RDNA (64/32)
+        // branch, so they fall through to OTHER and miss RDNA-specific tuning.
+        if (const char * arch = getenv("GGML_VK_FORCE_ARCHITECTURE")) {
+            if (!strcmp(arch, "gcn")) {
+                device->architecture = vk_device_architecture::AMD_GCN;
+            } else if (!strcmp(arch, "rdna1")) {
+                device->architecture = vk_device_architecture::AMD_RDNA1;
+            } else if (!strcmp(arch, "rdna2")) {
+                device->architecture = vk_device_architecture::AMD_RDNA2;
+            } else if (!strcmp(arch, "rdna3")) {
+                device->architecture = vk_device_architecture::AMD_RDNA3;
+            } else {
+                GGML_LOG_WARN("ggml_vulkan: ignoring unknown GGML_VK_FORCE_ARCHITECTURE=%s\n", arch);
+            }
+        }
 
         const char* GGML_VK_PREFER_HOST_MEMORY = getenv("GGML_VK_PREFER_HOST_MEMORY");
         device->prefer_host_memory = GGML_VK_PREFER_HOST_MEMORY != nullptr;
@@ -4231,7 +4257,7 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->vendor_id = device->properties.vendorID;
         device->driver_id = driver_props.driverID;
 
-        device->external_memory_host = device->external_memory_host && ggml_vk_external_memory_host_usable(device->driver_id);
+        device->external_memory_host = device->external_memory_host && ggml_vk_external_memory_host_usable(driver_props);
 
         // Implementing the async backend interfaces seems broken on older Intel HW,
         // see https://github.com/ggml-org/llama.cpp/issues/17302.
@@ -4284,6 +4310,16 @@ vk_device ggml_vk_get_device(size_t idx) {
             device->shader_core_count = ggml_vk_intel_shader_core_count(device->physical_device);
         } else {
             device->shader_core_count = 0;
+        }
+        // Some drivers do not expose a compute-unit count at all: MoltenVK, for
+        // example, implements neither VK_AMD_shader_core_properties nor its v2,
+        // so every AMD GPU on macOS lands here with a count of 0. That silently
+        // disables the split-k heuristic in ggml_vk_guess_split_k(), which is
+        // gated on shader_core_count != 0, so large-k matmuls never split even
+        // when the GPU is left mostly idle. Let the user supply the count the
+        // driver won't.
+        if (const char * cores = getenv("GGML_VK_SHADER_CORE_COUNT")) {
+            device->shader_core_count = (uint32_t) std::max(0L, strtol(cores, nullptr, 10));
         }
         device->float_controls_rte_fp16 = vk12_props.shaderRoundingModeRTEFloat16;
         device->float_controls_denorm_preserve_fp16 = vk12_props.shaderDenormPreserveFloat16;
@@ -5499,7 +5535,7 @@ void ggml_vk_instance_init() {
             props2.pNext = &driver_props;
             driver_props.pNext = &ext_props;
             vkdev.getProperties2(&props2);
-            host_buffer_import = ggml_vk_external_memory_host_usable(driver_props.driverID) &&
+            host_buffer_import = ggml_vk_external_memory_host_usable(driver_props) &&
                                  ggml_vk_host_buffer_import_usable(props2.properties.vendorID);
             if (host_buffer_import) {
                 vk_instance.host_import_alignment = std::max<size_t>(vk_instance.host_import_alignment, ext_props.minImportedHostPointerAlignment);
