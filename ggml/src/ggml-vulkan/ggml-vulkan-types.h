@@ -365,6 +365,10 @@ static constexpr uint32_t p021_max_gqa_ratio = 8;
 // multi-row KQ kernel (mul_mat_vec_p021_mr.comp): workgroup size and largest head dim
 static constexpr uint32_t p021_mr_wg_size = 128;
 static constexpr uint32_t p021_mr_max_cols = 256;
+// multi-row KQV kernel (mul_mat_vec_nc_mr.comp): workgroup size; head-dim rows per workgroup is
+// 8 up to GQA 2 and 4 above (more workgroups; rows x GQA also stays within its 32 accumulators)
+static constexpr uint32_t nc_mr_wg_size = 256;
+static inline uint32_t nc_mr_rows(uint32_t gqa_ratio) { return gqa_ratio <= 2 ? 8 : 4; }
 
 enum vk_device_architecture {
     OTHER,
@@ -814,6 +818,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
     vk_pipeline pipeline_mul_mat_vec_p021_mr_f16_f32[p021_max_gqa_ratio];
+    vk_pipeline pipeline_mul_mat_vec_nc_mr_f16_f32[p021_max_gqa_ratio];
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];

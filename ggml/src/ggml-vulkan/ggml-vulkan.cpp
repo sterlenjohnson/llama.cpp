@@ -3299,6 +3299,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
         ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_p021_mr_f16_f32[i], "mul_mat_vec_p021_mr_f16_f32"+std::to_string(i+1), mul_mat_vec_p021_mr_f16_f32_len, mul_mat_vec_p021_mr_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_p021_mr_push_constants), {1, 1, 1}, {p021_mr_wg_size, i + 1, p021_mr_max_cols}, 1, true);
     }
+    if (device->subgroup_basic && device->subgroup_arithmetic) {
+        for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
+            ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_nc_mr_f16_f32[i], "mul_mat_vec_nc_mr_f16_f32"+std::to_string(i+1), mul_mat_vec_nc_mr_f16_f32_len, mul_mat_vec_nc_mr_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_mr_push_constants), {1, 1, 1}, {nc_mr_wg_size, i + 1, nc_mr_rows(i + 1)}, 1, true);
+        }
+    }
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
@@ -7297,6 +7302,85 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
         }, pc, { 1, (uint32_t)ne01, workgroups_z });
 }
 
+// Multi-row KQV path for mul_mat_vec_nc: one workgroup per (V head, group of head-dim rows), covering every q
+// head that shares the V head. Returns false when the shapes do not fit it.
+static bool ggml_vk_mul_mat_vec_nc_mr_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * dst = cgraph->nodes[node_idx];
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    ggml_tensor * out = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+
+    static const bool disabled = getenv("GGML_VK_DISABLE_NC_MR") != nullptr;
+    if (disabled || !ctx->device->pipeline_mul_mat_vec_nc_mr_f16_f32[0]) {
+        return false;
+    }
+
+    const uint64_t ne00 = src0->ne[0];
+    const uint64_t ne01 = src0->ne[1];
+    const uint64_t ne02 = src0->ne[2];
+    const uint64_t ne12 = src1->ne[2];
+
+    if (src0->ne[3] != 1 || src1->ne[3] != 1 || ne02 == 0 || ne12 % ne02 != 0) {
+        return false;
+    }
+    const uint32_t gqa_ratio = (uint32_t)(ne12 / ne02);
+    // Measured on a Radeon Pro 5600M: the gain comes from sharing V and probability loads across GQA heads, and
+    // shows from about 1024 cache positions (gqa 4, hd 128: 21 -> 18 us at 1024, 146 -> 80 us at 8448). Without
+    // GQA, or with a short cache, the per-row kernel is as fast or faster.
+    if (gqa_ratio < 2 || gqa_ratio > p021_max_gqa_ratio || ne00 < 1024) {
+        return false;
+    }
+    if (src0->nb[0] != sizeof(ggml_fp16_t) || src0->nb[1] % 16 != 0 || src0->nb[2] % 16 != 0 ||
+        src1->nb[0] != sizeof(float) || src1->nb[2] % 16 != 0 || get_misalign_bytes(ctx, src1) % 16 != 0 ||
+        !ggml_is_contiguous(out) ||
+        ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange ||
+        ne02 > ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
+        return false;
+    }
+
+    vk_pipeline pipeline = ctx->device->pipeline_mul_mat_vec_nc_mr_f16_f32[gqa_ratio - 1];
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, out, true);
+    vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
+    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1, true);
+
+    vk_subbuffer d_F0 = d_D;
+    uint32_t fusion_flags = 0;
+    if (ctx->num_additional_fused_ops > 0) {
+        const ggml_tensor * add = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
+
+        d_F0 = ggml_vk_tensor_subbuffer(ctx, bias);
+        fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS0;
+    }
+    vk_subbuffer d_F1 = d_D;
+    if (ctx->num_additional_fused_ops > 1) {
+        const ggml_tensor * bias = cgraph->nodes[node_idx + 2]->src[1];
+
+        d_F1 = ggml_vk_tensor_subbuffer(ctx, bias);
+        fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS1;
+    }
+
+    vk_mat_vec_nc_mr_push_constants pc = {
+        (uint32_t)ne00, (uint32_t)ne01,
+        (uint32_t)(src0->nb[1] / sizeof(ggml_fp16_t)), (uint32_t)(src0->nb[2] / sizeof(ggml_fp16_t)),
+        (uint32_t)(src1->nb[2] / sizeof(float)),
+        0, 0, fusion_flags
+    };
+    init_pushconst_tensor_offsets(ctx, pc, src0, src1, nullptr, nullptr, out);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {
+            d_Qx,
+            d_Qy,
+            d_D,
+            d_F0,
+            d_F1,
+        }, pc, { (uint32_t)ne02, (uint32_t)CEIL_DIV(ne01, nc_mr_rows(gqa_ratio)), 1 });
+    return true;
+}
+
 static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = dst->src[0];
@@ -7332,6 +7416,10 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
 
     GGML_ASSERT(ne11 == 1);
     GGML_ASSERT(src0->ne[3] == src1->ne[3]); // checked in supports_op
+
+    if (ggml_vk_mul_mat_vec_nc_mr_f16_f32(ctx, subctx, cgraph, node_idx)) {
+        return;
+    }
 
     const uint32_t row_stride_x = nb01 / sizeof(ggml_fp16_t);
     const uint32_t channel_stride_x = nb02 / sizeof(ggml_fp16_t);

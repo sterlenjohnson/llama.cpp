@@ -55,6 +55,17 @@ struct vk_mat_vec_p021_mr_push_constants {
     uint32_t fusion_flags;
 };
 
+struct vk_mat_vec_nc_mr_push_constants {
+    uint32_t ncols_x;
+    uint32_t nrows_x;
+    uint32_t row_stride_x;     // in halves
+    uint32_t channel_stride_x; // in halves
+    uint32_t channel_stride_y; // in floats
+    uint32_t b_offset;
+    uint32_t d_offset;
+    uint32_t fusion_flags;
+};
+
 struct vk_mat_vec_nc_push_constants {
     uint32_t ncols_x;
     uint32_t nrows_x;
@@ -946,6 +957,15 @@ template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * 
 }
 
 template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_mat_vec_p021_mr_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.b_offset = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
+    p.d_offset = get_misalign_bytes(ctx, dst) / ggml_type_size(dst->type);
+
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src2);
+    GGML_UNUSED(src3);
+}
+
+template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_mat_vec_nc_mr_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
     p.b_offset = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
     p.d_offset = get_misalign_bytes(ctx, dst) / ggml_type_size(dst->type);
 
