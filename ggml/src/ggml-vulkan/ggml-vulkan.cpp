@@ -2886,6 +2886,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             rm_stdq = 2;
             rm_kq = 4;
             rm_stdq_int = 4;
+        } else if (device->driver_id == vk::DriverId::eMoltenvk) {
+            // Radeon Pro 5600M under MoltenVK: 4 rows per workgroup for K-quants decodes ~6% faster on a 9B Q4_K_M
+            // (28.0 -> 29.7 tok/s, two interleaved rounds) and is neutral on Gemma e4b. Standard quants regress at 4 rows.
+            rm_kq = 4;
         }
     } else if (device->vendor_id == VK_VENDOR_ID_INTEL) {
         rm_stdq = 2;
@@ -2902,6 +2906,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
         return is_rdna3_or_4 ? 4u : rows;
     };
+    if (const char * v = getenv("GGML_VK_RM_KQ"))   { rm_kq   = (uint32_t) atoi(v); }
+    if (const char * v = getenv("GGML_VK_RM_STDQ")) { rm_stdq = (uint32_t) atoi(v); }
     uint32_t rm_iq = 2 * rm_kq;
 
     const bool use_subgroups = device->subgroup_arithmetic;
