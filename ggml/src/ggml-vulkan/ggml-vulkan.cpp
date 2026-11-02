@@ -3299,7 +3299,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
         ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_p021_mr_f16_f32[i], "mul_mat_vec_p021_mr_f16_f32"+std::to_string(i+1), mul_mat_vec_p021_mr_f16_f32_len, mul_mat_vec_p021_mr_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_p021_mr_push_constants), {1, 1, 1}, {p021_mr_wg_size, i + 1, p021_mr_max_cols}, 1, true);
     }
-    if (device->subgroup_basic && device->subgroup_arithmetic) {
+    // nc_mr reduces through a shared buffer sized for 32 subgroups of a 256-invocation workgroup, so the smallest
+    // subgroup it may run with is 8 (smaller sizes, e.g. llvmpipe or SwiftShader, would overflow it).
+    if (device->subgroup_basic && device->subgroup_arithmetic && device->subgroup_size >= 8 &&
+        (!device->subgroup_size_control || device->subgroup_min_size >= 8)) {
         for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
             ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_nc_mr_f16_f32[i], "mul_mat_vec_nc_mr_f16_f32"+std::to_string(i+1), mul_mat_vec_nc_mr_f16_f32_len, mul_mat_vec_nc_mr_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_mr_push_constants), {1, 1, 1}, {nc_mr_wg_size, i + 1, nc_mr_rows(i + 1)}, 1, true);
         }
@@ -7333,6 +7336,7 @@ static bool ggml_vk_mul_mat_vec_nc_mr_f16_f32(ggml_backend_vk_context * ctx, vk_
     }
     if (src0->nb[0] != sizeof(ggml_fp16_t) || src0->nb[1] % 16 != 0 || src0->nb[2] % 16 != 0 ||
         src1->nb[0] != sizeof(float) || src1->nb[2] % 16 != 0 || get_misalign_bytes(ctx, src1) % 16 != 0 ||
+        get_misalign_bytes(ctx, src0) != 0 ||
         !ggml_is_contiguous(out) ||
         ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange ||
         ne02 > ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {

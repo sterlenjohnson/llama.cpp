@@ -14176,6 +14176,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, k, {8, 1}, {4, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 64, 1, k, {8, 1}, {4, 1}));
     }
+    // KQV with GQA 2, 5, 6 and 7 (the 8-rows-per-workgroup variant and odd ratios) and a cache length with a
+    // 4-column tail (2300 % 8 == 4), strided and contiguous V
+    for (int64_t k : {2300, 2304}) {
+        for (int64_t nr : {2, 5, 6, 7}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, k, {4, 1}, {nr, 1}, {0, 1, 2, 3}, (k + 255) / 256 * 256 + 256));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, k, {4, 1}, {nr, 1}));
+        }
+    }
     // bandwidth comparison at Bonsai-2 shapes
     for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_TQ2_0}) {
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, 1, 5120, {1, 1}, {1, 1}));
