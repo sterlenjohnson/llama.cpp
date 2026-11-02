@@ -3296,6 +3296,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_p021_f16_f32[i], "mul_mat_vec_p021_f16_f32"+std::to_string(i+1), mul_mat_vec_p021_f16_f32_len,              mul_mat_vec_p021_f16_f32_data,              "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_p021_push_constants), {1, 1, 1}, {device->subgroup_size, i + 1}, 1, true);
         }
     }
+    for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
+        ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_p021_mr_f16_f32[i], "mul_mat_vec_p021_mr_f16_f32"+std::to_string(i+1), mul_mat_vec_p021_mr_f16_f32_len, mul_mat_vec_p021_mr_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_p021_mr_push_constants), {1, 1, 1}, {p021_mr_wg_size, i + 1, p021_mr_max_cols}, 1, true);
+    }
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
@@ -7108,6 +7111,84 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 }
 
+// Invocations per cache position for the multi-row KQ kernel (power of two). Measured on a Radeon Pro 5600M
+// (MoltenVK): 4 is best without GQA and for short caches, 2 once each K row feeds several q heads; 1 (a whole
+// row per invocation, uncoalesced) is 2-3x slower. GGML_VK_P021_SPLIT forces a value (1..16).
+static uint32_t ggml_vk_p021_mr_split(uint64_t ncols, uint64_t nrows, uint64_t nchannels_x, uint32_t gqa_ratio) {
+    static const int forced = [] {
+        const char * e = getenv("GGML_VK_P021_SPLIT");
+        return e ? atoi(e) : 0;
+    }();
+    const uint32_t max_split = std::min<uint32_t>(16, (uint32_t)(ncols / 8));
+    uint32_t want = (gqa_ratio == 1 || nrows * nchannels_x < 4096) ? 4 : 2;
+    if (forced > 0) {
+        want = (uint32_t)forced;
+    }
+    uint32_t split = 1;
+    while (split * 2 <= want && split * 2 <= max_split) {
+        split *= 2;
+    }
+    return split;
+}
+
+static void ggml_vk_mul_mat_vec_p021_mr_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, uint32_t gqa_ratio) {
+    ggml_tensor * dst = cgraph->nodes[node_idx];
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    const uint64_t ne00 = src0->ne[0];
+    const uint64_t ne01 = src0->ne[1];
+    const uint64_t ne02 = src0->ne[2];
+    const uint64_t ne12 = src1->ne[2];
+
+    vk_pipeline pipeline = ctx->device->pipeline_mul_mat_vec_p021_mr_f16_f32[gqa_ratio - 1];
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops], true);
+    vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
+    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1, true);
+
+    vk_subbuffer d_F0 = d_D;
+    uint32_t fusion_flags = 0;
+    if (ctx->num_additional_fused_ops > 0) {
+        const ggml_tensor * add = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
+
+        d_F0 = ggml_vk_tensor_subbuffer(ctx, bias);
+        fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS0;
+    }
+    vk_subbuffer d_F1 = d_D;
+    if (ctx->num_additional_fused_ops > 1) {
+        const ggml_tensor * bias = cgraph->nodes[node_idx + 2]->src[1];
+
+        d_F1 = ggml_vk_tensor_subbuffer(ctx, bias);
+        fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS1;
+    }
+
+    const uint32_t split = ggml_vk_p021_mr_split(ne00, ne01, ne02, gqa_ratio);
+    const uint32_t rows_per_wg = p021_mr_wg_size / split;
+
+    vk_mat_vec_p021_mr_push_constants pc = {
+        (uint32_t)ne00, (uint32_t)ne01, (uint32_t)ne02, (uint32_t)ne12,
+        (uint32_t)(src0->nb[1] / 16), (uint32_t)(src0->nb[2] / 16), (uint32_t)(src1->nb[2] / sizeof(float)),
+        split, 0, 0, fusion_flags
+    };
+    init_pushconst_tensor_offsets(ctx, pc, src0, src1, nullptr, nullptr, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
+
+    // heads go in x so that consecutively launched workgroups read neighbouring memory: the heads of one
+    // cache position are contiguous, the positions of one head are a whole cache row apart
+    const uint32_t workgroups_x = gqa_ratio > 1 ? (uint32_t)ne12 / gqa_ratio : (uint32_t)ne12;
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {
+            d_Qx,
+            d_Qy,
+            d_D,
+            d_F0,
+            d_F1,
+        }, pc, { workgroups_x, (uint32_t)CEIL_DIV(ne01, rows_per_wg), 1 });
+}
+
 static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = dst->src[0];
@@ -7138,6 +7219,22 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
     uint32_t gqa_ratio = (uint32_t)ne12 / (uint32_t)ne02;
     if (gqa_ratio > 8 || gqa_ratio == 0 || ne12 != ne02 * gqa_ratio) {
         gqa_ratio = 1;
+    }
+
+    // Multi-row path: one workgroup covers many cache positions of one K head. It needs whole 16-byte
+    // K chunks (head dim and K strides multiples of 8 halves) and a head dim that fits its shared q buffer.
+    const uint64_t nb01 = src0->nb[1];
+    const uint64_t nb02 = src0->nb[2];
+    const uint64_t nb12 = src1->nb[2];
+    static const bool mr_disabled = getenv("GGML_VK_DISABLE_P021_MR") != nullptr;
+    const bool use_mr = !mr_disabled &&
+        src0->nb[0] == sizeof(ggml_fp16_t) && src1->nb[0] == sizeof(float) &&
+        ne00 % 8 == 0 && ne00 <= p021_mr_max_cols &&
+        nb01 % 16 == 0 && nb02 % 16 == 0 && nb12 % sizeof(float) == 0 &&
+        ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange;
+    if (use_mr) {
+        ggml_vk_mul_mat_vec_p021_mr_f16_f32(ctx, subctx, cgraph, node_idx, gqa_ratio);
+        return;
     }
 
     vk_pipeline pipeline = ctx->device->pipeline_mul_mat_vec_p021_f16_f32[gqa_ratio - 1];

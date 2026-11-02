@@ -1,0 +1,148 @@
+#version 450
+
+// Multi-row variant of mul_mat_vec_p021 for the decode-time KQ product (K x q with a
+// 0213-permuted f16 K and f32 q, one query token). mul_mat_vec_p021.comp runs one
+// workgroup per (cache position, head) and walks all positions of head 0 before head 1,
+// so neighbouring workgroups read 256 bytes each from places a whole cache row apart
+// and the K cache is swept sparsely once per head.
+//
+// Here a workgroup covers WG_SIZE / split cache positions of one K head, and the heads
+// are the fastest-varying workgroup index (x), so workgroups launched together read
+// neighbouring memory (the heads of one position are contiguous). Each position
+// is owned by `split` consecutive invocations, which read interleaved 16-byte chunks
+// (8 x f16) of the row; the query vectors of all gqa_ratio heads that share this K head
+// are staged once in shared memory. With split == 1 an invocation reduces a whole row
+// by itself; otherwise the split partial sums are added through shared memory.
+//
+// Host requirements: ncols_x % 8 == 0, ncols_x <= MAX_COLS, K row and channel strides
+// in whole 16-byte units, split a power of two dividing WG_SIZE.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint WG_SIZE = 128;
+// gqa_ratio is in the range [1,8]
+layout(constant_id = 1) const uint gqa_ratio = 1;
+layout(constant_id = 2) const uint MAX_COLS = 256;
+
+#define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
+#define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
+
+layout (binding = 0) readonly buffer A {uvec4 data_a[];}; // 8 x f16 per element
+layout (binding = 1) readonly buffer B {float data_b[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+layout (binding = 3) readonly buffer Fuse0 {float data_fuse0[];};
+layout (binding = 4) readonly buffer Fuse1 {float data_fuse1[];};
+
+layout (push_constant) uniform parameter
+{
+    uint ncols_x;          // head dim
+    uint nrows_x;          // cache positions
+    uint nchannels_x;      // K heads
+    uint nchannels_y;      // q heads
+    uint row_stride_x;     // in 8 x f16 units
+    uint channel_stride_x; // in 8 x f16 units
+    uint channel_stride_y; // in floats
+    uint split;            // invocations per row
+    uint b_offset;
+    uint d_offset;
+    uint fusion_flags;
+} p;
+
+shared vec4 q_sh[8 * MAX_COLS / 4];
+shared float red_sh[8 * WG_SIZE];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint split = p.split;
+    const uint part = tid & (split - 1);
+    const uint rows_per_wg = WG_SIZE / split;
+    const uint row = gl_WorkGroupID.y * rows_per_wg + tid / split;
+
+    uint channel, channel_x;
+    if (gqa_ratio > 1) {
+        channel_x = gl_WorkGroupID.x;
+        channel = channel_x * gqa_ratio;
+    } else {
+        channel = gl_WorkGroupID.x;
+        channel_x = channel / (p.nchannels_y / p.nchannels_x);
+    }
+
+    const uint ncols = p.ncols_x;
+
+    // stage q for every head sharing this K head
+    for (uint i = tid; i < gqa_ratio * ncols / 4; i += WG_SIZE) {
+        const uint c = (4 * i) / ncols;
+        const uint k = (4 * i) % ncols;
+        const uint iy = p.b_offset + (channel + c) * p.channel_stride_y + k;
+        q_sh[i] = vec4(data_b[iy], data_b[iy + 1], data_b[iy + 2], data_b[iy + 3]);
+    }
+    barrier();
+
+    float acc[8];
+    [[unroll]] for (uint c = 0; c < 8; ++c) {
+        acc[c] = 0.0f;
+    }
+
+    if (row < p.nrows_x) {
+        const uint base = row * p.row_stride_x + channel_x * p.channel_stride_x;
+        const uint nchunks = ncols / 8;
+        const uint qstride = ncols / 4;
+
+        uint j = part;
+        // issue four 16-byte loads before using any of them
+        for (; j + 3 * split < nchunks; j += 4 * split) {
+            uvec4 kv[4];
+            [[unroll]] for (uint u = 0; u < 4; ++u) {
+                kv[u] = data_a[base + j + u * split];
+            }
+            [[unroll]] for (uint u = 0; u < 4; ++u) {
+                const vec4 k0 = vec4(unpackHalf2x16(kv[u].x), unpackHalf2x16(kv[u].y));
+                const vec4 k1 = vec4(unpackHalf2x16(kv[u].z), unpackHalf2x16(kv[u].w));
+                [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
+                    const uint qi = c * qstride + 2 * (j + u * split);
+                    acc[c] += dot(k0, q_sh[qi]) + dot(k1, q_sh[qi + 1]);
+                }
+            }
+        }
+        for (; j < nchunks; j += split) {
+            const uvec4 kv = data_a[base + j];
+            const vec4 k0 = vec4(unpackHalf2x16(kv.x), unpackHalf2x16(kv.y));
+            const vec4 k1 = vec4(unpackHalf2x16(kv.z), unpackHalf2x16(kv.w));
+            [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
+                const uint qi = c * qstride + 2 * j;
+                acc[c] += dot(k0, q_sh[qi]) + dot(k1, q_sh[qi + 1]);
+            }
+        }
+    }
+
+    if (split > 1) {
+        [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
+            red_sh[c * WG_SIZE + tid] = acc[c];
+        }
+        barrier();
+        if (part == 0) {
+            for (uint s = 1; s < split; ++s) {
+                [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
+                    acc[c] += red_sh[c * WG_SIZE + tid + s];
+                }
+            }
+        }
+    }
+
+    if (part == 0 && row < p.nrows_x) {
+        [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
+            // dst is not transposed and not permuted
+            const uint idst = (channel + c) * p.nrows_x + row;
+            float r = acc[c];
+            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+                r += data_fuse0[idst];
+            }
+            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
+                r += data_fuse1[idst];
+            }
+            data_d[p.d_offset + idst] = r;
+        }
+    }
+}
