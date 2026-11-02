@@ -4366,8 +4366,13 @@ vk_device ggml_vk_get_device(size_t idx) {
             device->coopmat_support = false;
         }
 
-        // MoltenVK reports the packed 4x8 dot as not accelerated; GGML_VK_FORCE_INT_DOT keeps the MMVQ/MMQ pipelines anyway so the emulated path can be benchmarked.
-        if (!getenv("GGML_VK_FORCE_INT_DOT")) {
+        // AMD under MoltenVK reports the packed 4x8 dot as not accelerated (Metal has no dot4), but the emulated dot
+        // still speeds up quantized prompt matmuls (MMQ) by 50-80% on Q4_K. Keep it on by default there;
+        // GGML_VK_DISABLE_INT_DOT opts out, GGML_VK_FORCE_INT_DOT forces it on for other drivers.
+        const bool moltenvk_amd = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eMoltenvk;
+        if (getenv("GGML_VK_DISABLE_INT_DOT")) {
+            device->integer_dot_product = false;
+        } else if (!moltenvk_amd && !getenv("GGML_VK_FORCE_INT_DOT")) {
             device->integer_dot_product = device->integer_dot_product && shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated;
         }
 
@@ -5012,6 +5017,10 @@ vk_device ggml_vk_get_device(size_t idx) {
             device->mmvq_mode = -1;
         } else if (getenv("GGML_VK_FORCE_MMVQ")) {
             device->mmvq_mode = 1;
+        } else if (device->integer_dot_product && !device->coopmat_int_support &&
+                   device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eMoltenvk) {
+            // Emulated dot makes the MMVQ mat-vec kernel ~16% slower for decode than the dequant path, so keep decode off MMVQ.
+            device->mmvq_mode = -1;
         }
 
         // publish the device only when it is fully built
