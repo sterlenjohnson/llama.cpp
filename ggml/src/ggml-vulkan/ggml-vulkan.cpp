@@ -4366,7 +4366,10 @@ vk_device ggml_vk_get_device(size_t idx) {
             device->coopmat_support = false;
         }
 
-        device->integer_dot_product = device->integer_dot_product && shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated;
+        // MoltenVK reports the packed 4x8 dot as not accelerated; GGML_VK_FORCE_INT_DOT keeps the MMVQ/MMQ pipelines anyway so the emulated path can be benchmarked.
+        if (!getenv("GGML_VK_FORCE_INT_DOT")) {
+            device->integer_dot_product = device->integer_dot_product && shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated;
+        }
 
         device->min_imported_host_pointer_alignment = external_memory_host_props.minImportedHostPointerAlignment;
 
