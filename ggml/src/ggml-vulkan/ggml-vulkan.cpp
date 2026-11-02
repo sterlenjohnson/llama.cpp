@@ -7701,10 +7701,20 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                                   y_decode_vector_staging || y_needs_k_padding);
     const bool qy_needs_dequant = y_needs_reformat;
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, nei1, true));
+    // Each expert only sees about nei0*nei1/n_as of the batch's rows, so tile width should follow that, not the
+    // whole batch. Measured on the Radeon Pro 5600M under MoltenVK: LFM2.5-24B-A2B IQ2_XXS prompt speed 60 -> 160 tok/s,
+    // OLMoE unchanged, perplexity identical. On by default only for AMD+MoltenVK; GGML_VK_MOE_TILE_BY_BATCH restores the
+    // old choice and GGML_VK_MOE_TILE_ROWS_PER_EXPERT forces the new one elsewhere.
+    static const bool moe_tile_force_on = getenv("GGML_VK_MOE_TILE_ROWS_PER_EXPERT") != nullptr;
+    static const bool moe_tile_force_off = getenv("GGML_VK_MOE_TILE_BY_BATCH") != nullptr;
+    const bool moe_tile_by_expert_rows = !moe_tile_force_off &&
+        (moe_tile_force_on || (ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->driver_id == vk::DriverId::eMoltenvk));
+    const uint32_t tile_n = moe_tile_by_expert_rows ? (uint32_t) std::max<uint64_t>(1, CEIL_DIV(nei0 * nei1, n_as)) : (uint32_t) nei1;
+
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, tile_n, true));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, nei1, aligned, true);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, tile_n, aligned, true);
 
     const uint32_t bn = pipeline->wg_denoms[1];
     const uint64_t max_tiles = ggml_vk_mul_mat_id_max_tiles(n_as, nei0 * nei1, bn);
