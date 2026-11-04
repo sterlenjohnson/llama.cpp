@@ -1,5 +1,9 @@
 # llama.cpp
 
+> [!NOTE]
+> **Fork for AMD GPUs on macOS via Vulkan/MoltenVK** (built and measured on a Radeon Pro 5600M). On top of PrismML's `prism`
+> branch: prompt processing up to **~3x** and decode at 4k context up to **~2x** faster on that GPU. See [`FORK.md`](FORK.md).
+
 > [!IMPORTANT]
 > **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
 >
