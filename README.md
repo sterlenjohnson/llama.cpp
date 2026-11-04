@@ -4,9 +4,6 @@
 > **Fork for AMD GPUs on macOS via Vulkan/MoltenVK** (built and measured on a Radeon Pro 5600M). On top of PrismML's `prism`
 > branch: prompt processing up to **~3x** and decode at 4k context up to **~2x** faster on that GPU. See [`FORK.md`](FORK.md).
 
-> [!NOTE]
-> **Other branch: [`cuda-ada-4060ti`](https://github.com/sterlenjohnson/llama.cpp/tree/cuda-ada-4060ti)** targets an RTX 4060 Ti 16 GB (CUDA, sm_89) on a Fedora VM under Proxmox, where KSM on the host hurt performance. It has no code changes on top of `prism` yet: its `FORK.md` lists the candidate MoE expert-cache, KV-streaming and IPv6 RPC patches, with the benchmarks measured so far (for example Flash Next at 57.6k context: 243 prefill / 8.0 decode with the cache + KV-stream merge, against 209 / 10.1 for the GS build).
-
 > [!IMPORTANT]
 > **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
 >
