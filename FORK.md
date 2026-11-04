@@ -63,20 +63,6 @@ Open problem: the arena halves prefill on the merge. Ruled out by measurement: a
 decode to 18.66), and a silent fall back out of the streamed kernels. The gap widens with context (2x at 6k, about 10x at
 57.6k), which points at resident-page churn.
 
-**Strata engine on the same box (not llama.cpp), Swift Qwen3.8 Flash-Next IQ3_XXS, 262k context, 300 tokens, temperature 0**
-
-Included because it is the comparison this branch is trying to close. Three short prompts, one run each, so treat it as
-indicative only. DFlash2 ran on upstream Strata v0.2.10 without `--pool-workers`; MTP ran on the older production binary
-with its full config.
-
-| Drafter | Decode | Drafts accepted |
-|---|---|---|
-| MTP (production) | 36.2 / 43.0 / 38.5 | about 78% |
-| DFlash2 | 27.1 / 28.0 / 28.1 | about 66% |
-
-For scale, an earlier same-box run measured stock llama.cpp CPU-offloaded MoE at about 1.7 tok/s decode against Strata's
-22 to 26 (IQ2_XS vs IQ4_XS quants, different context lengths), so the engine, not the quant, dominates.
-
 ## Verification
 
 None of the candidate patches has been rebuilt or run on `prism` yet. Before trusting any speedup, compare output or
