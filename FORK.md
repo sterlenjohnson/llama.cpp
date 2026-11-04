@@ -14,6 +14,11 @@ the MoltenVK branch is in it.
 | CPU / RAM | Core i9-9880H (8 cores), 16 GB |
 | OS | Fedora 44, kernel `7.2.8-310.t2.fc44`, Mesa 26.2.3 RADV, Vulkan 1.4.354 |
 
+## Platform
+
+Fedora 44 on the t2linux kernel: install notes at the [t2linux Fedora guide](https://wiki.t2linux.org/distributions/fedora/installation/),
+kernel packages from the [`t2linux/fedora-kernel`](https://github.com/t2linux/fedora-kernel) project (COPR `sharpenedblade/t2linux`).
+
 ## Highlights
 
 | Result | Effect |
@@ -33,6 +38,21 @@ wired IPv6). Swapping only the node from macOS/MoltenVK to this Linux/RADV build
 (a step of 0.154 s down to 0.109 s) and long-prompt prefill from 11.7 to 183 tok/s. The split is node-bound on both
 systems: during the 13k prefill the 5600M is 87% busy on average while the 4060 Ti sits at 12%. The dual-stack (IPv6)
 RPC transport is in this branch; the hub must run the same patch.
+
+## Power and thermal unlock
+
+The 5600M and the CPU share one heat pipe, and the T2's SMC sheds heat by cutting the GPU first, then the CPU. The scripts
+in [`scripts/t2-5600m/`](scripts/t2-5600m/README.md) are what this branch's numbers were taken with.
+
+- **The decode clamp is a hardware assertion.** The 35B's slow mode (about 11 tok/s) is every core pinned at 800 MHz while the
+  GPU falls from 1145 to 500 MHz, with the package at only 59 to 65 C. Clearing MSR `0x1FC` bit 0 (BD PROCHOT) with `prochot.py`
+  lifts it: the clamp costs about 5% of decode at 32k and about 30% at 128k (11.7 against 16.5 to 17.5 tok/s). A reboot re-arms it.
+- **Follow the SMC, don't fix the cap.** A fixed 40 W GPU cap was killed by the watchdog at 101 C, 63% through the 128k prefill.
+  Following the SMC's own request (`smc_cap_follow.py`) finished it: 130.6 tok/s prefill, junction steady at 99 C, no root.
+- **Caps:** 35 W is the one that finishes at every depth (91 C at 128k); 40 W reaches 102 C at 128k with no margin; at 45 W
+  runs died at 101 to 104 C. The 2k row is the control: the cap does not bind there.
+- **Caveats:** `power_cap_sweep.sh` is untested here, raising the cap above its default needs the amdgpu overdrive mask, and
+  clearing BD PROCHOT removes a safety net, so watch the junction temperature. The scripts are for this model of Mac only.
 
 ## Caveats
 
