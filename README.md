@@ -1,5 +1,12 @@
 # llama.cpp
 
+> [!NOTE]
+> **Fork for the Radeon Pro 5600M on Linux (T2 MacBook Pro, Fedora) via Vulkan/RADV.** Upstream llama.cpp plus RDNA1 decode kernels,
+> a long-context crash fix and a MoE expert cache: **3.7 to 31x** faster prefill and **1.2 to 2.7x** faster decode than the same
+> GPU on macOS, and a 35B-A3B at 128k context at about **27 tok/s**. The GPU also serves as an RPC worker for a 4060 Ti hub
+> (27B Q5: decode 11.3 to 16.5 tok/s, 13k prefill 11.7 to 183 tok/s against a macOS node). See [`FORK.md`](FORK.md).
+> The macOS/MoltenVK twin is branch [`vk-rdna1-5600m`](https://github.com/sterlenjohnson/llama.cpp/blob/vk-rdna1-5600m/FORK.md).
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
