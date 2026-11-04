@@ -1,5 +1,10 @@
 # llama.cpp
 
+> [!NOTE]
+> **Hardware branches of this fork:**
+> - [`cuda-ada-4060ti`](https://github.com/sterlenjohnson/llama.cpp/tree/cuda-ada-4060ti): RTX 4060 Ti 16 GB (CUDA, sm_89) on a Fedora VM under Proxmox, where KSM on the host hurt performance. No code changes on top of `prism` yet; its `FORK.md` lists the candidate MoE expert-cache, KV-streaming and IPv6 RPC patches with the benchmarks measured so far (Flash Next at 57.6k context: 243 prefill / 8.0 decode with the cache + KV-stream merge, against 209 / 10.1 for the GS build).
+> - [`vk-rdna1-5600m`](https://github.com/sterlenjohnson/llama.cpp/tree/vk-rdna1-5600m): AMD Radeon Pro 5600M on macOS via Vulkan/MoltenVK, with prompt processing up to about 3x and decode at 4k context up to about 2x faster.
+
 > [!IMPORTANT]
 > **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
 >
