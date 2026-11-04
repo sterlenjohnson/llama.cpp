@@ -4,6 +4,7 @@
 > **Hardware branches of this fork** (details, changes and benchmarks are in each branch's `FORK.md`):
 > - [`cuda-ada-4060ti`](https://github.com/sterlenjohnson/llama.cpp/blob/cuda-ada-4060ti/FORK.md): RTX 4060 Ti 16 GB (CUDA) on a Fedora VM under Proxmox.
 > - [`vk-rdna1-5600m`](https://github.com/sterlenjohnson/llama.cpp/blob/vk-rdna1-5600m/FORK.md): Radeon Pro 5600M on macOS via Vulkan/MoltenVK.
+> - [`vk-rdna1-5600m-linux`](https://github.com/sterlenjohnson/llama.cpp/blob/vk-rdna1-5600m-linux/FORK.md): the same Radeon Pro 5600M on Linux (T2 Fedora) via Vulkan/RADV, on upstream rather than `prism`: 3.7 to 31x the macOS prefill, and as an RPC worker for a 4060 Ti hub it lifts a 27B Q5 split from 11.3 to 16.5 tok/s decode and 11.7 to 183 tok/s on a 13k prompt.
 
 > [!IMPORTANT]
 > **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
