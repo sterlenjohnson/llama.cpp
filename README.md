@@ -1,5 +1,8 @@
 # llama.cpp
 
+> [!NOTE]
+> **Branch `cuda-ada-4060ti`** is the RTX 4060 Ti 16 GB (Ada, sm_89) branch, run on a Fedora VM under Proxmox. See [FORK.md](FORK.md) for the test machine, candidate changes and benchmarks. It has no code changes on top of `prism` yet.
+
 > [!IMPORTANT]
 > **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
 >
